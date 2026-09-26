@@ -1,4 +1,4 @@
-import { characters, eventSource, event_types, getCharacterSource, saveSettingsDebounced } from '/script.js';
+import { characters, eventSource, event_types, getRequestHeaders, saveSettingsDebounced } from '/script.js';
 import { extension_settings } from '/scripts/extensions.js';
 import { Popup, POPUP_TYPE } from '/scripts/popup.js';
 import { renderTemplateAsync } from '/scripts/templates.js';
@@ -7,6 +7,16 @@ import { importFromExternalUrl, isValidUrl } from '/scripts/utils.js';
 const MODULE = 'dupeLinkSkip';
 const IMPORT_SELECTOR = '.external_import_button, #external_import_button';
 const CHECKBOX_ID = 'dupe_link_skip_prevent';
+const FETCH_CONCURRENCY = 6;
+
+// Cache of avatar -> source key ('' = card has no source). Needed because with
+// performance.lazyLoadCharacters the character list lacks data.extensions,
+// so each card's full data has to be fetched once to read its source.
+const sourceCache = localforage.createInstance({ name: 'SillyTavern_DupeLinkSkip' });
+/** @type {Promise<Record<string, string>>|null} */
+let indexPromise = null;
+/** @type {((done: number, total: number) => void)|null} */
+let onIndexProgress = null;
 
 function getSettings() {
     if (!extension_settings[MODULE]) {
@@ -74,17 +84,111 @@ function chubKey(parts) {
 }
 
 /**
- * Collects source keys for every character currently in the library.
- * @returns {Set<string>}
+ * Source key for a character, mirroring ST's getCharacterSource().
+ * @param {any} character Full (non-shallow) character object
+ * @returns {string}
  */
-function getExistingKeys() {
+function keyFromCharacter(character) {
+    const ext = character?.data?.extensions ?? {};
+    if (ext.chub?.full_path) return normalizeSource(`https://chub.ai/characters/${ext.chub.full_path}`);
+    if (ext.pygmalion_id) return normalizeSource(`https://pygmalion.chat/${ext.pygmalion_id}`);
+    if (ext.github_repo) return normalizeSource(`https://github.com/${ext.github_repo}`);
+    if (ext.source_url) return normalizeSource(ext.source_url);
+    const risu = ext.risuai?.source;
+    if (Array.isArray(risu) && typeof risu[0] === 'string' && risu[0].startsWith('risurealm:')) {
+        return `risu:${risu[0].split(':')[1].toLowerCase()}`;
+    }
+    if (ext.perchance_data?.slug) return normalizeSource(ext.perchance_data.slug);
+    return '';
+}
+
+async function fetchFullCharacter(avatar) {
+    const response = await fetch('/api/characters/get', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ avatar_url: avatar }),
+    });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    return response.json();
+}
+
+/**
+ * Makes sure every character in the library has a cached source key,
+ * fetching full card data only for characters not seen before.
+ * @returns {Promise<Record<string, string>>}
+ */
+async function buildIndex() {
+    const index = (await sourceCache.getItem('index')) ?? {};
+    const avatars = new Set(characters.map(c => c.avatar));
+
+    // Forget deleted characters
+    for (const avatar of Object.keys(index)) {
+        if (!avatars.has(avatar)) delete index[avatar];
+    }
+
+    const missing = [];
+    for (const character of characters) {
+        if (character.avatar in index) continue;
+        if (!character.shallow) {
+            index[character.avatar] = keyFromCharacter(character);
+        } else {
+            missing.push(character.avatar);
+        }
+    }
+
+    let done = 0;
+    const worker = async () => {
+        while (missing.length) {
+            const avatar = missing.pop();
+            try {
+                index[avatar] = keyFromCharacter(await fetchFullCharacter(avatar));
+            } catch (error) {
+                console.warn('[Dupe Link Skip] Could not read character', avatar, error);
+            }
+            done++;
+            onIndexProgress?.(done, done + missing.length);
+            if (done % 200 === 0) await sourceCache.setItem('index', index);
+        }
+    };
+    await Promise.all(Array.from({ length: FETCH_CONCURRENCY }, worker));
+
+    await sourceCache.setItem('index', index);
+    return index;
+}
+
+function ensureIndex() {
+    indexPromise ??= buildIndex().finally(() => { indexPromise = null; });
+    return indexPromise;
+}
+
+/**
+ * Collects source keys for every character currently in the library.
+ * @returns {Promise<Set<string>>}
+ */
+async function getExistingKeys() {
     const settings = getSettings();
     const avatars = new Set(characters.map(c => c.avatar));
     const keys = new Set();
 
-    // Sources embedded in the cards themselves (not available for shallow/lazy-loaded chars)
-    for (let i = 0; i < characters.length; i++) {
-        const key = normalizeSource(getCharacterSource(i));
+    let toast = null;
+    onIndexProgress = (done, total) => {
+        if (total < 20) return;
+        const text = `Checking existing characters for duplicates... ${done}/${total}`;
+        if (!toast) {
+            toast = toastr.info(text, 'Import Characters', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false });
+        } else {
+            toast.find('.toast-message').text(text);
+        }
+    };
+    let index;
+    try {
+        index = await ensureIndex();
+    } finally {
+        onIndexProgress = null;
+        if (toast) toastr.clear(toast);
+    }
+
+    for (const key of Object.values(index)) {
         if (key) keys.add(key);
     }
 
@@ -129,7 +233,7 @@ async function onImportClick() {
     }
 
     const inputs = String(input).split('\n').map(x => x.trim()).filter(x => x.length > 0);
-    const existing = preventDuplicates ? getExistingKeys() : new Set();
+    const existing = preventDuplicates ? await getExistingKeys() : new Set();
     const skipped = [];
 
     for (const url of inputs) {
@@ -166,4 +270,6 @@ eventSource.on(event_types.APP_READY, () => {
     // Replace core's import handler with ours (same dialog + checkbox)
     $(document).off('click', IMPORT_SELECTOR);
     $(document).on('click', IMPORT_SELECTOR, onImportClick);
+    // Warm the source index in the background so the first import isn't slow
+    ensureIndex().catch(error => console.warn('[Dupe Link Skip] Index build failed', error));
 });
