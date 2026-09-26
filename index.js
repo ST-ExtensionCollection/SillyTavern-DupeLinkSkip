@@ -1,8 +1,9 @@
-import { characters, eventSource, event_types, getRequestHeaders, saveSettingsDebounced } from '/script.js';
+import { characters, eventSource, event_types, getRequestHeaders, processDroppedFiles, saveSettingsDebounced } from '/script.js';
 import { extension_settings, renderExtensionTemplateAsync } from '/scripts/extensions.js';
 import { Popup, POPUP_TYPE } from '/scripts/popup.js';
 import { renderTemplateAsync } from '/scripts/templates.js';
-import { importFromExternalUrl, isValidUrl } from '/scripts/utils.js';
+import { getStringHash, importFromExternalUrl, isValidUrl } from '/scripts/utils.js';
+import { importWorldInfo } from '/scripts/world-info.js';
 
 const MODULE = 'dupeLinkSkip';
 const EXTENSION_PATH = 'third-party/SillyTavern-DupeLinkSkip';
@@ -10,9 +11,9 @@ const IMPORT_SELECTOR = '.external_import_button, #external_import_button';
 const CHECKBOX_ID = 'dupe_link_skip_prevent';
 const FETCH_CONCURRENCY = 6;
 
-// Cache of avatar -> source key ('' = card has no source). Needed because with
-// performance.lazyLoadCharacters the character list lacks data.extensions,
-// so each card's full data has to be fetched once to read its source.
+// Cache of avatar -> { key, hash } (source key and content hash, '' = none).
+// Needed because with performance.lazyLoadCharacters the character list lacks
+// card data, so each card has to be fetched once to read its source/content.
 const sourceCache = localforage.createInstance({ name: 'SillyTavern_DupeLinkSkip' });
 /** @type {Promise<void>|null} */
 let refreshPromise = null;
@@ -23,6 +24,7 @@ function getSettings() {
     }
     const settings = extension_settings[MODULE];
     settings.preventDuplicates ??= true;
+    settings.contentCheck ??= false;
     // Map of normalized source key -> avatar file name, for imports whose
     // source ST doesn't store on the card (JanitorAI, generic PNG links, etc).
     settings.imported ??= {};
@@ -82,6 +84,101 @@ function chubKey(parts) {
     return parts.length >= 2 ? `chub:${parts.slice(0, 2).join('/').toLowerCase()}` : '';
 }
 
+const CONTENT_FIELDS = [
+    'name', 'description', 'personality', 'scenario', 'first_mes', 'mes_example',
+    'system_prompt', 'post_history_instructions',
+];
+
+function cleanText(value) {
+    return typeof value === 'string' ? value.replace(/\r\n?/g, '\n').trim() : '';
+}
+
+/**
+ * Hash of a card's content, ignoring metadata (creator, notes, tags, version,
+ * extensions, avatar image). Works on raw card JSON (V1/V2/V3) and ST characters.
+ * @param {any} card
+ * @returns {string} Hash, or '' if the card has no content to compare.
+ */
+function contentHash(card) {
+    if (!card) return '';
+    const get = (field) => card.data?.[field] ?? card[field];
+
+    const fields = CONTENT_FIELDS.map(f => cleanText(get(f)));
+    const greetings = (get('alternate_greetings') ?? []).map(cleanText).filter(Boolean);
+    const book = (get('character_book')?.entries ?? []).map(e => [
+        (e.keys ?? []).map(cleanText).join(','),
+        (e.secondary_keys ?? []).map(cleanText).join(','),
+        cleanText(e.content),
+    ]);
+
+    // Name alone isn't enough to call two cards identical
+    if (!fields.slice(1).some(Boolean) && !greetings.length) return '';
+
+    const text = JSON.stringify([fields, greetings, book]);
+    return `${getStringHash(text, 0).toString(36)}.${getStringHash(text, 1).toString(36)}`;
+}
+
+/**
+ * Reads the card JSON from a downloaded PNG or JSON file.
+ * @param {File} file
+ * @returns {Promise<any|null>}
+ */
+async function readCardFromFile(file) {
+    try {
+        const buffer = new Uint8Array(await file.arrayBuffer());
+        const isPng = buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47;
+        if (!isPng) return JSON.parse(new TextDecoder().decode(buffer));
+
+        const view = new DataView(buffer.buffer);
+        const chunks = {};
+        for (let i = 8; i + 8 <= buffer.length;) {
+            const length = view.getUint32(i);
+            const type = String.fromCharCode(...buffer.subarray(i + 4, i + 8));
+            if (type === 'tEXt') {
+                const data = buffer.subarray(i + 8, i + 8 + length);
+                const sep = data.indexOf(0);
+                const keyword = new TextDecoder().decode(data.subarray(0, sep)).toLowerCase();
+                chunks[keyword] = new TextDecoder('latin1').decode(data.subarray(sep + 1));
+            }
+            if (type === 'IEND') break;
+            i += 12 + length;
+        }
+
+        const base64 = chunks.ccv3 ?? chunks.chara;
+        if (!base64) return null;
+        const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+        return JSON.parse(new TextDecoder().decode(bytes));
+    } catch (error) {
+        console.warn('[Dupe Link Skip] Could not read card data', error);
+        return null;
+    }
+}
+
+/**
+ * Downloads content the same way ST's importFromExternalUrl does, without importing it.
+ * @param {string} url
+ * @returns {Promise<{file: File, type: string}|null>}
+ */
+async function downloadExternal(url) {
+    const endpoint = isValidUrl(url) ? '/api/content/importURL' : '/api/content/importUUID';
+    const request = await fetch(endpoint, {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ url }),
+    });
+
+    if (!request.ok) {
+        toastr.info(request.statusText, 'Custom content import failed');
+        console.error('Custom content import failed', request.status, request.statusText);
+        return null;
+    }
+
+    const data = await request.blob();
+    const type = request.headers.get('X-Custom-Content-Type');
+    const fileName = request.headers.get('Content-Disposition').split('filename=')[1].replace(/"/g, '');
+    return { file: new File([data], fileName, { type: data.type }), type };
+}
+
 /**
  * Source key for a character, mirroring ST's getCharacterSource().
  * @param {any} character Full (non-shallow) character object
@@ -101,6 +198,10 @@ function keyFromCharacter(character) {
     return '';
 }
 
+function indexEntry(character) {
+    return { key: keyFromCharacter(character), hash: contentHash(character) };
+}
+
 async function fetchFullCharacter(avatar) {
     const response = await fetch('/api/characters/get', {
         method: 'POST',
@@ -112,10 +213,14 @@ async function fetchFullCharacter(avatar) {
 }
 
 /**
- * @returns {Promise<{index: Record<string, string>, updated: number|null}>}
+ * @returns {Promise<{index: Record<string, {key: string, hash?: string}>, updated: number|null}>}
  */
 async function loadIndex() {
     const index = (await sourceCache.getItem('index')) ?? {};
+    // Older versions stored only the source key; those get re-scanned for a hash
+    for (const [avatar, value] of Object.entries(index)) {
+        if (typeof value === 'string') index[avatar] = { key: value };
+    }
     const updated = (await sourceCache.getItem('updated')) ?? null;
     return { index, updated };
 }
@@ -138,9 +243,9 @@ async function refreshIndex(full, onProgress) {
 
     const missing = [];
     for (const character of characters) {
-        if (character.avatar in index) continue;
+        if (index[character.avatar]?.hash !== undefined) continue;
         if (!character.shallow) {
-            index[character.avatar] = keyFromCharacter(character);
+            index[character.avatar] = indexEntry(character);
         } else {
             missing.push(character.avatar);
         }
@@ -153,7 +258,7 @@ async function refreshIndex(full, onProgress) {
         while (missing.length) {
             const avatar = missing.pop();
             try {
-                index[avatar] = keyFromCharacter(await fetchFullCharacter(avatar));
+                index[avatar] = indexEntry(await fetchFullCharacter(avatar));
             } catch (error) {
                 console.warn('[Dupe Link Skip] Could not read character', avatar, error);
             }
@@ -168,29 +273,33 @@ async function refreshIndex(full, onProgress) {
 }
 
 /**
- * Collects source keys for every character currently in the library,
- * from the saved list plus anything readable without fetching.
- * @returns {Promise<Set<string>>}
+ * Collects source keys and content hashes for every character currently in
+ * the library, from the saved list plus anything readable without fetching.
+ * @returns {Promise<{keys: Set<string>, hashes: Set<string>}>}
  */
-async function getExistingKeys() {
+async function getExisting() {
     const settings = getSettings();
     const avatars = new Set(characters.map(c => c.avatar));
     const keys = new Set();
+    const hashes = new Set();
 
     const { index, updated } = await loadIndex();
     if (!updated) {
         toastr.warning('Existing characters haven\'t been scanned yet, so only characters imported with this extension are checked. Use Extensions > Dupe Link Skip > Rebuild all.', 'Dupe Link Skip', { timeOut: 10000 });
     }
 
-    for (const [avatar, key] of Object.entries(index)) {
-        if (key && avatars.has(avatar)) keys.add(key);
+    for (const [avatar, { key, hash }] of Object.entries(index)) {
+        if (!avatars.has(avatar)) continue;
+        if (key) keys.add(key);
+        if (hash) hashes.add(hash);
     }
 
     // Fully loaded characters (e.g. ones opened this session) can be read directly
     for (const character of characters) {
         if (!character.shallow) {
-            const key = keyFromCharacter(character);
+            const { key, hash } = indexEntry(character);
             if (key) keys.add(key);
+            if (hash) hashes.add(hash);
         }
     }
 
@@ -203,16 +312,17 @@ async function getExistingKeys() {
         }
     }
 
-    return keys;
+    return { keys, hashes };
 }
 
 async function updateStatus() {
     const { index, updated } = await loadIndex();
     const avatars = new Set(characters.map(c => c.avatar));
-    const scanned = Object.keys(index).filter(a => avatars.has(a)).length;
-    const linked = Object.entries(index).filter(([a, k]) => k && avatars.has(a)).length;
+    const live = Object.entries(index).filter(([a]) => avatars.has(a)).map(([, v]) => v);
+    const linked = live.filter(v => v.key).length;
+    const hashed = live.filter(v => v.hash !== undefined).length;
     const when = updated ? new Date(updated).toLocaleString() : 'never';
-    $('#dupe_link_skip_status').text(`Scanned ${scanned} / ${characters.length} characters (${linked} with links). Last scan: ${when}.`);
+    $('#dupe_link_skip_status').text(`Scanned ${hashed} / ${characters.length} characters (${linked} with links). Last scan: ${when}.`);
 }
 
 async function onRefreshClick(full) {
@@ -242,6 +352,12 @@ async function addSettingsPanel() {
         .prop('checked', getSettings().preventDuplicates)
         .on('change', function () {
             getSettings().preventDuplicates = !!$(this).prop('checked');
+            saveSettingsDebounced();
+        });
+    $('#dupe_link_skip_content')
+        .prop('checked', getSettings().contentCheck)
+        .on('change', function () {
+            getSettings().contentCheck = !!$(this).prop('checked');
             saveSettingsDebounced();
         });
     $('#dupe_link_skip_load_new').on('click', () => onRefreshClick(false));
@@ -281,38 +397,71 @@ async function onImportClick() {
     }
 
     const inputs = String(input).split('\n').map(x => x.trim()).filter(x => x.length > 0);
-    const existing = preventDuplicates ? await getExistingKeys() : new Set();
-    const skipped = [];
+    const contentCheck = preventDuplicates && settings.contentCheck;
+    const existing = preventDuplicates ? await getExisting() : { keys: new Set(), hashes: new Set() };
+    const skippedLinks = [];
+    const skippedContent = [];
 
     for (const url of inputs) {
         const key = normalizeSource(url);
         // Lorebooks aren't characters; leave them alone
         const isLorebook = key.startsWith('chublore:');
 
-        if (preventDuplicates && key && !isLorebook && existing.has(key)) {
-            skipped.push(url);
+        if (preventDuplicates && key && !isLorebook && existing.keys.has(key)) {
+            skippedLinks.push(url);
             continue;
         }
 
         const before = new Set(characters.map(c => c.avatar));
-        await importFromExternalUrl(url);
+        let hash;
 
-        if (key && !isLorebook) {
-            existing.add(key);
-            const added = characters.find(c => !before.has(c.avatar));
-            if (added) {
+        if (contentCheck && !isLorebook) {
+            const download = await downloadExternal(url);
+            if (!download) continue;
+
+            if (download.type === 'lorebook') {
+                await importWorldInfo(download.file);
+                continue;
+            }
+            if (download.type !== 'character') {
+                toastr.warning('Unknown content type');
+                console.error('Unknown content type', download.type);
+                continue;
+            }
+
+            hash = contentHash(await readCardFromFile(download.file));
+            if (hash && existing.hashes.has(hash)) {
+                skippedContent.push(url);
+                continue;
+            }
+            await processDroppedFiles([download.file]);
+        } else {
+            await importFromExternalUrl(url);
+        }
+
+        if (isLorebook) continue;
+        if (key) existing.keys.add(key);
+        if (hash) existing.hashes.add(hash);
+
+        const added = characters.find(c => !before.has(c.avatar));
+        if (added) {
+            if (key) {
                 settings.imported[key] = added.avatar;
                 saveSettingsDebounced();
-                const { index } = await loadIndex();
-                index[added.avatar] = key;
-                await sourceCache.setItem('index', index);
             }
+            const { index } = await loadIndex();
+            // hash stays undefined if not computed, so the next "Load new" fills it in
+            index[added.avatar] = hash !== undefined ? { key, hash } : { key };
+            await sourceCache.setItem('index', index);
         }
     }
 
-    if (skipped.length) {
-        console.info('[Dupe Link Skip] Skipped duplicates:', skipped);
-        toastr.info(`Skipped ${skipped.length} duplicate${skipped.length === 1 ? '' : 's'}.`, 'Import Characters');
+    const parts = [];
+    if (skippedLinks.length) parts.push(`${skippedLinks.length} duplicate link${skippedLinks.length === 1 ? '' : 's'}`);
+    if (skippedContent.length) parts.push(`${skippedContent.length} identical card${skippedContent.length === 1 ? '' : 's'}`);
+    if (parts.length) {
+        console.info('[Dupe Link Skip] Skipped duplicate links:', skippedLinks, 'identical cards:', skippedContent);
+        toastr.info(`Skipped ${parts.join(' and ')}.`, 'Import Characters');
     }
 }
 

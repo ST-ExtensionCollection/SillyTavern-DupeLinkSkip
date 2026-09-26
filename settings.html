@@ -9,8 +9,12 @@
                 <input type="checkbox" id="dupe_link_skip_default">
                 <span>Prevent Duplicates by default</span>
             </label>
+            <label class="checkbox_label" for="dupe_link_skip_content" title="Also skip cards whose content (name, description, greetings, etc.) is identical to an existing character, even from a different link. Metadata like creator, notes and tags is ignored.">
+                <input type="checkbox" id="dupe_link_skip_content">
+                <span>Also skip identical cards (content match)</span>
+            </label>
             <small>
-                Existing characters must be scanned once to learn their source links (needed when characters are lazy-loaded).
+                Existing characters must be scanned once to learn their source links and content hashes (needed when characters are lazy-loaded).
                 Characters imported through the Import Characters popup are added automatically.
             </small>
             <div class="flex-container marginTop5">
