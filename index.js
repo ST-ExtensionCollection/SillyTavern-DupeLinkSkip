@@ -1,10 +1,11 @@
 import { characters, eventSource, event_types, getRequestHeaders, saveSettingsDebounced } from '/script.js';
-import { extension_settings } from '/scripts/extensions.js';
+import { extension_settings, renderExtensionTemplateAsync } from '/scripts/extensions.js';
 import { Popup, POPUP_TYPE } from '/scripts/popup.js';
 import { renderTemplateAsync } from '/scripts/templates.js';
 import { importFromExternalUrl, isValidUrl } from '/scripts/utils.js';
 
 const MODULE = 'dupeLinkSkip';
+const EXTENSION_PATH = 'third-party/SillyTavern-DupeLinkSkip';
 const IMPORT_SELECTOR = '.external_import_button, #external_import_button';
 const CHECKBOX_ID = 'dupe_link_skip_prevent';
 const FETCH_CONCURRENCY = 6;
@@ -13,10 +14,8 @@ const FETCH_CONCURRENCY = 6;
 // performance.lazyLoadCharacters the character list lacks data.extensions,
 // so each card's full data has to be fetched once to read its source.
 const sourceCache = localforage.createInstance({ name: 'SillyTavern_DupeLinkSkip' });
-/** @type {Promise<Record<string, string>>|null} */
-let indexPromise = null;
-/** @type {((done: number, total: number) => void)|null} */
-let onIndexProgress = null;
+/** @type {Promise<void>|null} */
+let refreshPromise = null;
 
 function getSettings() {
     if (!extension_settings[MODULE]) {
@@ -113,12 +112,23 @@ async function fetchFullCharacter(avatar) {
 }
 
 /**
- * Makes sure every character in the library has a cached source key,
- * fetching full card data only for characters not seen before.
- * @returns {Promise<Record<string, string>>}
+ * @returns {Promise<{index: Record<string, string>, updated: number|null}>}
  */
-async function buildIndex() {
+async function loadIndex() {
     const index = (await sourceCache.getItem('index')) ?? {};
+    const updated = (await sourceCache.getItem('updated')) ?? null;
+    return { index, updated };
+}
+
+/**
+ * Fetches full card data for characters and stores their source keys.
+ * Only runs when the user clicks a button in the extension settings.
+ * @param {boolean} full Re-read every character instead of only ones not cached yet
+ * @param {(done: number, total: number) => void} onProgress
+ */
+async function refreshIndex(full, onProgress) {
+    const { index: cached } = await loadIndex();
+    const index = full ? {} : cached;
     const avatars = new Set(characters.map(c => c.avatar));
 
     // Forget deleted characters
@@ -136,7 +146,9 @@ async function buildIndex() {
         }
     }
 
+    const total = missing.length;
     let done = 0;
+    onProgress(done, total);
     const worker = async () => {
         while (missing.length) {
             const avatar = missing.pop();
@@ -145,24 +157,19 @@ async function buildIndex() {
             } catch (error) {
                 console.warn('[Dupe Link Skip] Could not read character', avatar, error);
             }
-            done++;
-            onIndexProgress?.(done, done + missing.length);
+            onProgress(++done, total);
             if (done % 200 === 0) await sourceCache.setItem('index', index);
         }
     };
     await Promise.all(Array.from({ length: FETCH_CONCURRENCY }, worker));
 
     await sourceCache.setItem('index', index);
-    return index;
-}
-
-function ensureIndex() {
-    indexPromise ??= buildIndex().finally(() => { indexPromise = null; });
-    return indexPromise;
+    await sourceCache.setItem('updated', Date.now());
 }
 
 /**
- * Collects source keys for every character currently in the library.
+ * Collects source keys for every character currently in the library,
+ * from the saved list plus anything readable without fetching.
  * @returns {Promise<Set<string>>}
  */
 async function getExistingKeys() {
@@ -170,26 +177,21 @@ async function getExistingKeys() {
     const avatars = new Set(characters.map(c => c.avatar));
     const keys = new Set();
 
-    let toast = null;
-    onIndexProgress = (done, total) => {
-        if (total < 20) return;
-        const text = `Checking existing characters for duplicates... ${done}/${total}`;
-        if (!toast) {
-            toast = toastr.info(text, 'Import Characters', { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false });
-        } else {
-            toast.find('.toast-message').text(text);
-        }
-    };
-    let index;
-    try {
-        index = await ensureIndex();
-    } finally {
-        onIndexProgress = null;
-        if (toast) toastr.clear(toast);
+    const { index, updated } = await loadIndex();
+    if (!updated) {
+        toastr.warning('Existing characters haven\'t been scanned yet, so only characters imported with this extension are checked. Use Extensions > Dupe Link Skip > Rebuild all.', 'Dupe Link Skip', { timeOut: 10000 });
     }
 
-    for (const key of Object.values(index)) {
-        if (key) keys.add(key);
+    for (const [avatar, key] of Object.entries(index)) {
+        if (key && avatars.has(avatar)) keys.add(key);
+    }
+
+    // Fully loaded characters (e.g. ones opened this session) can be read directly
+    for (const character of characters) {
+        if (!character.shallow) {
+            const key = keyFromCharacter(character);
+            if (key) keys.add(key);
+        }
     }
 
     // Sources recorded by this extension, dropping ones whose character was deleted
@@ -202,6 +204,51 @@ async function getExistingKeys() {
     }
 
     return keys;
+}
+
+async function updateStatus() {
+    const { index, updated } = await loadIndex();
+    const avatars = new Set(characters.map(c => c.avatar));
+    const scanned = Object.keys(index).filter(a => avatars.has(a)).length;
+    const linked = Object.entries(index).filter(([a, k]) => k && avatars.has(a)).length;
+    const when = updated ? new Date(updated).toLocaleString() : 'never';
+    $('#dupe_link_skip_status').text(`Scanned ${scanned} / ${characters.length} characters (${linked} with links). Last scan: ${when}.`);
+}
+
+async function onRefreshClick(full) {
+    if (refreshPromise) return;
+    const buttons = $('#dupe_link_skip_load_new, #dupe_link_skip_rebuild');
+    buttons.addClass('disabled').prop('disabled', true);
+    refreshPromise = refreshIndex(full, (done, total) => {
+        $('#dupe_link_skip_status').text(`Scanning characters... ${done} / ${total}`);
+    });
+    try {
+        await refreshPromise;
+        toastr.success('Character scan complete.', 'Dupe Link Skip');
+    } catch (error) {
+        console.error('[Dupe Link Skip] Scan failed', error);
+        toastr.error(String(error), 'Dupe Link Skip scan failed');
+    } finally {
+        refreshPromise = null;
+        buttons.removeClass('disabled').prop('disabled', false);
+        await updateStatus();
+    }
+}
+
+async function addSettingsPanel() {
+    const html = await renderExtensionTemplateAsync(EXTENSION_PATH, 'settings');
+    $('#extensions_settings2').append(html);
+    $('#dupe_link_skip_default')
+        .prop('checked', getSettings().preventDuplicates)
+        .on('change', function () {
+            getSettings().preventDuplicates = !!$(this).prop('checked');
+            saveSettingsDebounced();
+        });
+    $('#dupe_link_skip_load_new').on('click', () => onRefreshClick(false));
+    $('#dupe_link_skip_rebuild').on('click', () => onRefreshClick(true));
+    // Keep status current when the drawer is opened
+    $('#dupe_link_skip_settings .inline-drawer-toggle').on('click', () => updateStatus());
+    await updateStatus();
 }
 
 async function onImportClick() {
@@ -230,6 +277,7 @@ async function onImportClick() {
     if (settings.preventDuplicates !== preventDuplicates) {
         settings.preventDuplicates = preventDuplicates;
         saveSettingsDebounced();
+        $('#dupe_link_skip_default').prop('checked', preventDuplicates);
     }
 
     const inputs = String(input).split('\n').map(x => x.trim()).filter(x => x.length > 0);
@@ -255,6 +303,9 @@ async function onImportClick() {
             if (added) {
                 settings.imported[key] = added.avatar;
                 saveSettingsDebounced();
+                const { index } = await loadIndex();
+                index[added.avatar] = key;
+                await sourceCache.setItem('index', index);
             }
         }
     }
@@ -265,11 +316,10 @@ async function onImportClick() {
     }
 }
 
-eventSource.on(event_types.APP_READY, () => {
+eventSource.on(event_types.APP_READY, async () => {
     getSettings();
     // Replace core's import handler with ours (same dialog + checkbox)
     $(document).off('click', IMPORT_SELECTOR);
     $(document).on('click', IMPORT_SELECTOR, onImportClick);
-    // Warm the source index in the background so the first import isn't slow
-    ensureIndex().catch(error => console.warn('[Dupe Link Skip] Index build failed', error));
+    await addSettingsPanel();
 });

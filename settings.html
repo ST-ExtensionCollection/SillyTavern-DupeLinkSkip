@@ -1,0 +1,27 @@
+<div id="dupe_link_skip_settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <b>Dupe Link Skip</b>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <label class="checkbox_label" for="dupe_link_skip_default">
+                <input type="checkbox" id="dupe_link_skip_default">
+                <span>Prevent Duplicates by default</span>
+            </label>
+            <small>
+                Existing characters must be scanned once to learn their source links (needed when characters are lazy-loaded).
+                Characters imported through the Import Characters popup are added automatically.
+            </small>
+            <div class="flex-container marginTop5">
+                <div id="dupe_link_skip_load_new" class="menu_button" title="Scan only characters not scanned yet">
+                    <i class="fa-solid fa-plus"></i> Load new
+                </div>
+                <div id="dupe_link_skip_rebuild" class="menu_button" title="Clear the list and re-scan every character">
+                    <i class="fa-solid fa-rotate"></i> Rebuild all
+                </div>
+            </div>
+            <small id="dupe_link_skip_status"></small>
+        </div>
+    </div>
+</div>
