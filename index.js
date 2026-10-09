@@ -2,7 +2,8 @@ import { characters, eventSource, event_types, getRequestHeaders, processDropped
 import { extension_settings, renderExtensionTemplateAsync } from '/scripts/extensions.js';
 import { Popup, POPUP_TYPE } from '/scripts/popup.js';
 import { renderTemplateAsync } from '/scripts/templates.js';
-import { getStringHash, importFromExternalUrl, isValidUrl } from '/scripts/utils.js';
+import { getBase64Async, getStringHash, importFromExternalUrl, isValidUrl, uuidv4 } from '/scripts/utils.js';
+import { addTagsToEntity, tags, TAG_FOLDER_DEFAULT_TYPE } from '/scripts/tags.js';
 import { selected_group } from '/scripts/group-chats.js';
 import { importWorldInfo } from '/scripts/world-info.js';
 
@@ -11,6 +12,8 @@ const EXTENSION_PATH = 'third-party/SillyTavern-DupeLinkSkip';
 const IMPORT_SELECTOR = '.external_import_button, #external_import_button';
 const CHECKBOX_ID = 'dupe_link_skip_prevent';
 const EXPRESSIONS_CHECKBOX_ID = 'dupe_link_skip_expressions';
+const ASSETS_CHECKBOX_ID = 'dupe_link_skip_assets';
+const ASSET_LINKS_TAG = 'Asset links';
 const FETCH_CONCURRENCY = 6;
 
 // Cache of avatar -> { key, hash } (source key and content hash, '' = none).
@@ -20,7 +23,7 @@ const sourceCache = localforage.createInstance({ name: 'SillyTavern_DupeLinkSkip
 /** @type {Promise<void>|null} */
 let refreshPromise = null;
 /** @type {{stop: boolean}|null} */
-let expressionJob = null;
+let assetJob = null;
 // Set if the browser can't reach Chub's API directly (CORS); then go through ST's server
 let chubApiBlocked = false;
 
@@ -36,6 +39,14 @@ function getSettings() {
     settings.checkAddedPacks ??= false;
     // Set once packs downloaded before sprite associations existed have been linked
     settings.packsMigrated ??= false;
+    // Save Chub gallery and images embedded in card text locally
+    settings.localizeAssets ??= true;
+    // Which parts the backfill job runs
+    settings.backfillParts ??= {};
+    settings.backfillParts.expressions ??= true;
+    settings.backfillParts.gallery ??= true;
+    settings.backfillParts.images ??= true;
+    settings.backfillParts.links ??= true;
     // Map of normalized source key -> avatar file name, for imports whose
     // source ST doesn't store on the card (JanitorAI, generic PNG links, etc).
     settings.imported ??= {};
@@ -112,6 +123,9 @@ function cleanText(value) {
  */
 function contentHash(card) {
     if (!card) return '';
+    // Saved before this extension edited the card (local image links), so it keeps matching the original
+    const saved = (card.data?.extensions ?? card.extensions)?.dupe_link_skip?.content_hash;
+    if (saved) return saved;
     const get = (field) => card.data?.[field] ?? card[field];
 
     const fields = CONTENT_FIELDS.map(f => cleanText(get(f)));
@@ -575,6 +589,304 @@ async function importChubExpressions(character, chub, { gap = 0 } = {}) {
     return written;
 }
 
+
+const IMAGE_FORMATS = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif', 'image/bmp': 'bmp' };
+
+/**
+ * Downloads a file from another site: directly if it allows it (CORS),
+ * otherwise through ST's CORS proxy when that's enabled.
+ * @param {string} url
+ * @returns {Promise<Blob>}
+ */
+async function fetchExternal(url) {
+    try {
+        return await fetchBlob(url);
+    } catch (error) {
+        if (!(error instanceof TypeError)) throw error;
+        return await fetchBlob(`/proxy/${url}`);
+    }
+}
+
+function imageFormat(blob, url) {
+    const fromType = IMAGE_FORMATS[blob.type];
+    if (fromType) return fromType;
+    const ext = new URL(url, location.href).pathname.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase();
+    return ext && Object.values(IMAGE_FORMATS).concat('jpeg').includes(ext) ? ext : '';
+}
+
+/** @returns {Promise<string[]>} File names in user/images/<folder> (creates the folder) */
+async function listGalleryImages(folder) {
+    const response = await fetch('/api/images/list', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ folder }),
+    });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    return response.json();
+}
+
+/** @returns {Promise<string[]>} Folders in user/images */
+async function listGalleryFolders() {
+    const response = await fetch('/api/images/folders', { method: 'POST', headers: getRequestHeaders() });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    return response.json();
+}
+
+/**
+ * Saves an image to user/images/<folder>/<prefix>-<hash>.<ext>, unless a file
+ * with the same content is already there.
+ * @param {string} folder
+ * @param {string} prefix
+ * @param {Blob} blob
+ * @param {string} url Source URL (for the extension if the type is unknown)
+ * @param {Set<string>} existing File names already in the folder; updated
+ * @returns {Promise<{path: string, isNew: boolean}|null>} Local URL path, or null if not an image
+ */
+async function saveGalleryImage(folder, prefix, blob, url, existing) {
+    const format = imageFormat(blob, url);
+    if (!format) return null;
+    const hash = (await blobHash(blob)).slice(0, 12);
+    const name = `${prefix}-${hash}`;
+    const path = (file) => `/user/images/${encodeURIComponent(folder)}/${encodeURIComponent(file)}`;
+
+    const found = [...existing].find(f => f.replace(/\.[^.]+$/, '') === name);
+    if (found) return { path: path(found), isNew: false };
+
+    const image = (await getBase64Async(blob)).split(',')[1];
+    const response = await fetch('/api/images/upload', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ image, format, filename: name, ch_name: folder }),
+    });
+    if (!response.ok) throw new Error(`Image upload failed: ${response.status} ${response.statusText}`);
+    existing.add(`${name}.${format}`);
+    return { path: path(`${name}.${format}`), isNew: true };
+}
+
+/**
+ * Points ST's gallery for this character at its own folder (named after the
+ * avatar file), unless it already has a gallery folder set or images in the
+ * folder named after the character, which is where the gallery looks by default.
+ * @param {any} character
+ */
+async function associateGallery(character) {
+    const folders = extension_settings.gallery?.folders;
+    if (!folders || folders[character.avatar]) return;
+    const folder = avatarFolder(character.avatar);
+    if (character.name !== folder && (await listGalleryFolders()).includes(character.name)) {
+        if ((await listGalleryImages(character.name)).length) return;
+    }
+    folders[character.avatar] = folder;
+    saveSettingsDebounced();
+}
+
+/**
+ * Gets image URLs from a Chub character's gallery.
+ * @param {number|string} projectId extensions.chub.id
+ * @returns {Promise<string[]>}
+ */
+async function fetchChubGallery(projectId) {
+    const urls = [];
+    for (let page = 1; page <= 10; page++) {
+        const response = await fetch(`https://api.chub.ai/api/gallery/project/${projectId}?nsfw=true&page=${page}&limit=50`, { cache: 'no-cache' });
+        if (response.status === 429) throw new RateLimitError('429 from Chub gallery');
+        if (response.status === 404) break;
+        if (!response.ok) throw new Error(`Chub gallery: ${response.status} ${response.statusText}`);
+        const data = await response.json();
+        const nodes = data?.nodes ?? data?.data?.nodes ?? data?.data ?? (Array.isArray(data) ? data : []);
+        if (!Array.isArray(nodes) || !nodes.length) break;
+        for (const node of nodes) {
+            const url = node?.primary_image_path ?? node?.image_url ?? node?.url
+                ?? Object.values(node ?? {}).find(v => typeof v === 'string' && /^https?:\/\/\S+\.(png|jpe?g|webp|gif)(\?|$)/i.test(v));
+            if (url && !urls.includes(url)) urls.push(url);
+        }
+        if (nodes.length < 50) break;
+        await sleep(1000);
+    }
+    return urls;
+}
+
+/**
+ * Downloads a Chub character's gallery into its gallery folder.
+ * @param {any} character Full character
+ * @param {{gap?: number}} [options]
+ * @returns {Promise<number>} Images added
+ */
+async function importChubGallery(character, { gap = 0 } = {}) {
+    const projectId = character.data?.extensions?.chub?.id;
+    if (!projectId) return 0;
+    const urls = await fetchChubGallery(projectId);
+    if (!urls.length) return 0;
+
+    const folder = avatarFolder(character.avatar);
+    const existing = new Set(await listGalleryImages(folder));
+    let added = 0;
+    for (const url of urls) {
+        const saved = await saveGalleryImage(folder, 'chub', await fetchExternal(url), url, existing);
+        if (saved?.isNew) added++;
+        if (gap) await sleep(gap);
+    }
+    await associateGallery(character);
+    if (added) toastr.success(`${added} image${added === 1 ? '' : 's'}`, `Imported Gallery for ${folder}`);
+    return added;
+}
+
+const TEXT_FIELDS = [
+    'description', 'personality', 'scenario', 'first_mes', 'mes_example', 'creator_notes',
+    'system_prompt', 'post_history_instructions',
+];
+// ![alt](url "title") and <img ... src="url" ...>: [before URL, URL, rest of the element] for each
+const EMBEDDED_IMAGE = /(!\[[^\]]*\]\(\s*<?)(https?:\/\/[^\s)>]+)([^)]*\))|(<img\b[^>]*?\bsrc\s*=\s*["']?)(https?:\/\/[^"'\s>]+)([^>]*>)/gi;
+
+/**
+ * Saves images linked in a card's text to its gallery folder and points the
+ * text at the local copies. Each original URL is kept next to it in an ST
+ * comment macro ({{// original: url }}), which is hidden when shown and
+ * left out of prompts. Links that can't be downloaded are left as they are.
+ * @param {any} character Full character
+ * @param {{gap?: number}} [options]
+ * @returns {Promise<{saved: number, failed: number}>}
+ */
+async function localizeImages(character, { gap = 0 } = {}) {
+    const data = character.data ?? {};
+    const texts = TEXT_FIELDS.map(f => [f, data[f]]).filter(([, v]) => typeof v === 'string');
+    const greetings = Array.isArray(data.alternate_greetings) ? data.alternate_greetings : [];
+    const urls = new Set();
+    for (const text of [...texts.map(([, v]) => v), ...greetings]) {
+        for (const m of String(text ?? '').matchAll(EMBEDDED_IMAGE)) urls.add(m[2] ?? m[5]);
+    }
+    if (!urls.size) return { saved: 0, failed: 0 };
+
+    const folder = avatarFolder(character.avatar);
+    const existing = new Set(await listGalleryImages(folder));
+    /** @type {Record<string, string>} */
+    const local = {};
+    let failed = 0;
+    for (const url of urls) {
+        try {
+            const saved = await saveGalleryImage(folder, 'embed', await fetchExternal(url), url, existing);
+            if (saved) local[url] = saved.path; else failed++;
+        } catch (error) {
+            if (error instanceof RateLimitError) throw error;
+            console.warn('[Dupe Link Skip] Could not save image', url, error);
+            failed++;
+        }
+        if (gap) await sleep(gap);
+    }
+    if (!Object.keys(local).length) return { saved: 0, failed };
+
+    const rewrite = (text) => String(text ?? '').replace(EMBEDDED_IMAGE, (match, mdStart, mdUrl, mdRest, imgStart, imgUrl, imgRest) => {
+        const url = mdUrl ?? imgUrl;
+        if (!local[url]) return match;
+        return `${mdStart ?? imgStart}${local[url]}${mdRest ?? imgRest}{{// original: ${url} }}`;
+    });
+
+    const changes = {};
+    for (const [field, value] of texts) {
+        const updated = rewrite(value);
+        if (updated !== value) changes[field] = updated;
+    }
+    const newGreetings = greetings.map(rewrite);
+    if (newGreetings.some((g, i) => g !== greetings[i])) changes.alternate_greetings = newGreetings;
+
+    const ext = data.extensions?.dupe_link_skip ?? {};
+    await mergeCharacter(character.avatar, {
+        ...changes,
+        extensions: {
+            dupe_link_skip: {
+                content_hash: ext.content_hash || contentHash(character),
+                images: { ...(ext.images ?? {}), ...local },
+            },
+        },
+    });
+    await associateGallery(character);
+
+    const saved = Object.keys(local).length;
+    toastr.success(`${saved} image${saved === 1 ? '' : 's'}` + (failed ? `, ${failed} failed` : ''), `Saved Card Images for ${folder}`);
+    return { saved, failed };
+}
+
+// V1 fields ST also keeps at the top level of the card (and reads from there in places)
+const TOP_LEVEL_FIELDS = { description: 'description', personality: 'personality', scenario: 'scenario', first_mes: 'first_mes', mes_example: 'mes_example', creator_notes: 'creatorcomment' };
+
+async function mergeCharacter(avatar, data) {
+    const topLevel = {};
+    for (const [field, top] of Object.entries(TOP_LEVEL_FIELDS)) {
+        if (data[field] !== undefined) topLevel[top] = data[field];
+    }
+    const response = await fetch('/api/characters/merge-attributes', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ avatar, ...topLevel, data }),
+    });
+    if (!response.ok) throw new Error(`Saving character failed: ${response.status} ${response.statusText}`);
+    const character = characters.find(c => c.avatar === avatar);
+    if (character && !character.shallow) {
+        // Keep the loaded copy current so ST doesn't save stale text over it
+        Object.assign(character, await fetchFullCharacter(avatar));
+    }
+}
+
+const ASSET_HOSTS = /catbox\.moe|drive\.google\.com|mega\.nz|pixeldrain\.com|mediafire\.com|dropbox\.com|files\.sillie\.st|\.zip(\?|$)/i;
+const ASSET_WORDS = /sprite|expression|emotion|outfit|pack|asset|lorebook|download/i;
+const NOTE_LINK = /https?:\/\/[^\s)\]"'<>]+/gi;
+
+/**
+ * Finds links in creator notes that look like extra assets (sprite packs,
+ * archives, file hosts), tags the character and remembers the links.
+ * @param {any} character Full character
+ * @returns {Promise<number>} Links found
+ */
+async function flagAssetLinks(character) {
+    const notes = String(character.data?.creator_notes ?? '');
+    const found = [];
+    for (const m of notes.matchAll(NOTE_LINK)) {
+        const url = m[0].replace(/[.,;:!?]+$/, '');
+        // Images shown in the notes aren't extra assets
+        if (/\.(png|jpe?g|webp|gif)(\?|$)/i.test(url) || url.includes('/user/images/')) continue;
+        const context = notes.slice(Math.max(0, m.index - 80), m.index + m[0].length + 80).replace(/\s+/g, ' ');
+        if (ASSET_HOSTS.test(url) || ASSET_WORDS.test(context)) {
+            if (!found.some(f => f.url === url)) found.push({ url, context: context.trim() });
+        }
+    }
+
+    const links = (await sourceCache.getItem('assetLinks')) ?? {};
+    if (found.length) links[character.avatar] = found; else delete links[character.avatar];
+    await sourceCache.setItem('assetLinks', links);
+    if (!found.length) return 0;
+
+    let tag = tags.find(t => t.name === ASSET_LINKS_TAG);
+    if (!tag) {
+        tag = {
+            id: uuidv4(), name: ASSET_LINKS_TAG, folder_type: TAG_FOLDER_DEFAULT_TYPE, filter_state: 'UNDEFINED',
+            sort_order: Math.max(0, ...tags.map(t => t.sort_order ?? 0)) + 1, is_hidden_on_character_card: false,
+            color: '', color2: '', create_date: Date.now(),
+        };
+        tags.push(tag);
+    }
+    addTagsToEntity(tag, character.avatar);
+    return found.length;
+}
+
+async function renderAssetLinks() {
+    const list = $('#dupe_link_skip_links_list').empty();
+    const links = (await sourceCache.getItem('assetLinks')) ?? {};
+    const byAvatar = new Map(characters.map(c => [c.avatar, c]));
+    const entries = Object.entries(links).filter(([avatar]) => byAvatar.has(avatar));
+    $('#dupe_link_skip_links_count').text(entries.length);
+    for (const [avatar, found] of entries) {
+        const item = $('<div class="marginBot5"></div>');
+        item.append($('<b></b>').text(`${byAvatar.get(avatar).name} (${avatarFolder(avatar)})`));
+        for (const { url, context } of found) {
+            const row = $('<div></div>');
+            row.append($('<a target="_blank" rel="noopener noreferrer"></a>').attr('href', url).text(url));
+            row.append($('<small class="flex-container"></small>').text(context));
+            item.append(row);
+        }
+        list.append(item);
+    }
+}
+
 /**
  * @returns {Promise<{index: Record<string, {key: string, hash?: string}>, updated: number|null}>}
  */
@@ -695,98 +1007,151 @@ async function markExpressionsChecked(avatar) {
 }
 
 /**
- * Downloads Chub expression packs for every Chub character not checked yet.
- * Runs one character at a time with pauses, so it can be left in the background.
+ * avatar -> which other parts (gallery, images, links) have been done, with timestamps.
+ * @returns {Promise<Record<string, {gallery?: number, images?: number, links?: number}>>}
+ */
+async function loadAssetsChecked() {
+    return (await sourceCache.getItem('assetsChecked')) ?? {};
+}
+
+async function markAssetsChecked(avatar, parts) {
+    const checked = await loadAssetsChecked();
+    checked[avatar] = { ...checked[avatar], ...Object.fromEntries(parts.map(p => [p, Date.now()])) };
+    await sourceCache.setItem('assetsChecked', checked);
+}
+
+/**
+ * Works through the library downloading whatever is enabled in
+ * settings.backfillParts: Chub expression packs and galleries, images embedded
+ * in card text, and asset links in notes. One character at a time with pauses,
+ * so it can be left running in the background. Each part is remembered per
+ * character, so later runs only do what's new.
  * @param {{stop: boolean}} job
  * @param {(text: string) => void} onStatus
  */
-async function backfillExpressions(job, onStatus) {
+async function backfillAssets(job, onStatus) {
+    const settings = getSettings();
+    const parts = settings.backfillParts;
     const { index } = await loadIndex();
-    const checked = await loadExpressionsChecked();
+    const exprChecked = await loadExpressionsChecked();
+    const assetsChecked = await loadAssetsChecked();
     const avatars = new Set(characters.map(c => c.avatar));
-    for (const avatar of Object.keys(checked)) {
-        if (!avatars.has(avatar)) delete checked[avatar];
+    for (const map of [exprChecked, assetsChecked]) {
+        for (const avatar of Object.keys(map)) {
+            if (!avatars.has(avatar)) delete map[avatar];
+        }
     }
+    const save = async () => {
+        await sourceCache.setItem('expressionsChecked', exprChecked);
+        await sourceCache.setItem('assetsChecked', assetsChecked);
+    };
 
-    const checkAdded = getSettings().checkAddedPacks;
-    const isDone = (entry) => entry && (!checkAdded || typeof entry === 'number' || entry.remote);
-    const queue = characters.filter(c => !isDone(checked[c.avatar]) && (c.shallow
-        ? index[c.avatar]?.key?.startsWith('chub:')
-        : c.data?.extensions?.chub));
+    const checkAdded = settings.checkAddedPacks;
+    const exprDone = (entry) => entry && (!checkAdded || typeof entry === 'number' || entry.remote);
+    const pendingParts = (c) => {
+        const isChub = c.shallow ? index[c.avatar]?.key?.startsWith('chub:') : !!c.data?.extensions?.chub;
+        const done = assetsChecked[c.avatar] ?? {};
+        return {
+            expressions: parts.expressions && isChub && !exprDone(exprChecked[c.avatar]),
+            gallery: parts.gallery && isChub && !done.gallery,
+            images: parts.images && !done.images,
+            links: parts.links && !done.links,
+        };
+    };
+    const queue = characters.filter(c => Object.values(pendingParts(c)).some(Boolean));
     const total = queue.length;
-    let done = 0, written = 0, withSprites = 0, failed = 0;
+    const result = { done: 0, total, sprites: 0, gallery: 0, images: 0, imagesFailed: 0, links: 0, failed: 0 };
 
     for (const character of queue) {
         if (job.stop) break;
-        onStatus(`Fetching expressions... ${done} / ${total} (${withSprites} with new sprites)`);
+        onStatus(`Fetching assets... ${result.done} / ${total} (sprites ${result.sprites}, gallery ${result.gallery}, images ${result.images}, links ${result.links})`);
+        const pending = pendingParts(character);
+        let usedChub = false;
         try {
             const full = character.shallow ? await fetchFullCharacter(character.avatar) : character;
-            let chub = full.data?.extensions?.chub;
-            const fullPath = chub?.full_path ?? index[character.avatar]?.key?.slice('chub:'.length);
+            const done = assetsChecked[character.avatar] ??= {};
 
-            if (!chubPacks(chub).length && !checkAdded) {
-                checked[character.avatar] = { t: Date.now(), remote: false };
-                done++;
-                continue;
+            if (pending.links) {
+                result.links += await flagAssetLinks(full);
+                done.links = Date.now();
             }
 
-            // Refresh from Chub first: one request instead of several failed/outdated image downloads
-            if (fullPath) {
-                chub = (await fetchChubExtension(fullPath)) ?? chub;
-                await sleep(1000);
+            if (pending.expressions) {
+                let chub = full.data?.extensions?.chub;
+                const fullPath = chub?.full_path ?? index[character.avatar]?.key?.slice('chub:'.length);
+                if (!chubPacks(chub).length && !checkAdded) {
+                    exprChecked[character.avatar] = { t: Date.now(), remote: false };
+                } else {
+                    // Refresh from Chub first: one request instead of several failed/outdated image downloads
+                    if (fullPath) {
+                        chub = (await fetchChubExtension(fullPath)) ?? chub;
+                        usedChub = true;
+                        await sleep(1000);
+                    }
+                    result.sprites += await importChubExpressions(full, chub, { gap: 250 });
+                    exprChecked[character.avatar] = { t: Date.now(), remote: true };
+                }
             }
 
-            const count = await importChubExpressions(full, chub, { gap: 250 });
-            checked[character.avatar] = { t: Date.now(), remote: true };
-            written += count;
-            if (count) {
-                withSprites++;
-                await sleep(1500);
+            if (pending.gallery) {
+                result.gallery += await importChubGallery(full, { gap: 250 });
+                usedChub = true;
+                done.gallery = Date.now();
+            }
+
+            if (pending.images) {
+                const { saved, failed } = await localizeImages(full, { gap: 250 });
+                result.images += saved;
+                result.imagesFailed += failed;
+                done.images = Date.now();
             }
         } catch (error) {
-            console.warn('[Dupe Link Skip] Could not fetch expressions for', character.avatar, error);
-            failed++;
+            console.warn('[Dupe Link Skip] Could not fetch assets for', character.avatar, error);
+            result.failed++;
             if (error instanceof RateLimitError) {
-                onStatus('Rate limited by Chub, waiting a minute...');
+                onStatus('Rate limited, waiting a minute...');
                 await sleep(60000);
             }
         }
-        done++;
-        if (done % 25 === 0) await sourceCache.setItem('expressionsChecked', checked);
+        if (usedChub) await sleep(1000);
+        result.done++;
+        if (result.done % 25 === 0) await save();
     }
 
-    await sourceCache.setItem('expressionsChecked', checked);
-    return { done, total, written, withSprites, failed };
+    await save();
+    await renderAssetLinks();
+    return result;
 }
 
-async function onExpressionsClick() {
+async function onAssetsClick() {
     const button = $('#dupe_link_skip_expr_fetch');
     const status = $('#dupe_link_skip_expr_status');
-    if (expressionJob) {
-        expressionJob.stop = true;
+    if (assetJob) {
+        assetJob.stop = true;
         button.text('Stopping...');
         return;
     }
 
     const { updated } = await loadIndex();
     if (!updated) {
-        toastr.warning('Characters haven\'t been scanned yet, so only already loaded Chub characters will be checked. Use Load new or Rebuild all first.', 'Dupe Link Skip', { timeOut: 10000 });
+        toastr.warning('Characters haven\'t been scanned yet, so Chub parts only run for already loaded Chub characters. Use Load new or Rebuild all first.', 'Dupe Link Skip', { timeOut: 10000 });
     }
 
-    const job = expressionJob = { stop: false };
+    const job = assetJob = { stop: false };
     button.html('<i class="fa-solid fa-stop"></i> Stop');
     try {
-        const result = await backfillExpressions(job, text => status.text(text));
-        const summary = `Checked ${result.done} / ${result.total} Chub characters: ${result.written} sprites added for ${result.withSprites} characters` +
-            (result.failed ? `, ${result.failed} failed (will retry next run)` : '') + '.';
+        const r = await backfillAssets(job, text => status.text(text));
+        const summary = `Processed ${r.done} / ${r.total} characters: ${r.sprites} sprites, ${r.gallery} gallery images, ` +
+            `${r.images} card images saved` + (r.imagesFailed ? ` (${r.imagesFailed} couldn't be downloaded)` : '') +
+            `, ${r.links} asset links found` + (r.failed ? `, ${r.failed} characters failed (will retry next run)` : '') + '.';
         status.text(summary);
         toastr.success(summary, 'Dupe Link Skip');
     } catch (error) {
-        console.error('[Dupe Link Skip] Expression fetch failed', error);
+        console.error('[Dupe Link Skip] Asset fetch failed', error);
         status.text(`Failed: ${error}`);
     } finally {
-        expressionJob = null;
-        button.html('<i class="fa-solid fa-face-smile"></i> Fetch Chub expressions');
+        assetJob = null;
+        button.html('<i class="fa-solid fa-download"></i> Fetch assets');
     }
 }
 
@@ -848,12 +1213,73 @@ async function addSettingsPanel() {
             saveSettingsDebounced();
         });
     $('#dupe_link_skip_relink').on('click', () => onRelinkClick());
-    $('#dupe_link_skip_expr_fetch').on('click', () => onExpressionsClick());
+    $('#dupe_link_skip_assets_default')
+        .prop('checked', getSettings().localizeAssets)
+        .on('change', function () {
+            getSettings().localizeAssets = !!$(this).prop('checked');
+            saveSettingsDebounced();
+        });
+    for (const part of ['expressions', 'gallery', 'images', 'links']) {
+        $(`#dupe_link_skip_part_${part}`)
+            .prop('checked', getSettings().backfillParts[part])
+            .on('change', function () {
+                getSettings().backfillParts[part] = !!$(this).prop('checked');
+                saveSettingsDebounced();
+            });
+    }
+    $('#dupe_link_skip_expr_fetch').on('click', () => onAssetsClick());
+    $('#dupe_link_skip_links_drawer .inline-drawer-toggle').on('click', () => renderAssetLinks());
     $('#dupe_link_skip_load_new').on('click', () => onRefreshClick(false));
     $('#dupe_link_skip_rebuild').on('click', () => onRefreshClick(true));
     // Keep status current when the drawer is opened
     $('#dupe_link_skip_settings .inline-drawer-toggle').on('click', () => updateStatus());
     await updateStatus();
+    await renderAssetLinks();
+}
+
+/**
+ * Runs the asset steps for a freshly imported character. Each step reports its
+ * own failure so one broken part doesn't stop the rest.
+ */
+async function importAssets(character, { isChub, downloadExpressions, localizeAssets }) {
+    let full;
+    try {
+        full = character.shallow ? await fetchFullCharacter(character.avatar) : character;
+    } catch (error) {
+        console.error('[Dupe Link Skip] Could not read imported character', character.avatar, error);
+        return;
+    }
+    const step = async (label, fn) => {
+        try {
+            await fn();
+        } catch (error) {
+            console.error(`[Dupe Link Skip] Could not ${label} for`, character.avatar, error);
+            toastr.warning(`Could not ${label} for ${character.name}.`, 'Import Characters');
+        }
+    };
+
+    await step('check notes for asset links', async () => {
+        await flagAssetLinks(full);
+        await markAssetsChecked(character.avatar, ['links']);
+    });
+    if (isChub && downloadExpressions) {
+        await step('download expressions', async () => {
+            await importChubExpressions(full, full.data?.extensions?.chub);
+            await markExpressionsChecked(character.avatar);
+        });
+    }
+    if (isChub && localizeAssets) {
+        await step('download the Chub gallery', async () => {
+            await importChubGallery(full);
+            await markAssetsChecked(character.avatar, ['gallery']);
+        });
+    }
+    if (localizeAssets) {
+        await step('save card images', async () => {
+            await localizeImages(full);
+            await markAssetsChecked(character.avatar, ['images']);
+        });
+    }
 }
 
 async function onImportClick() {
@@ -874,6 +1300,11 @@ async function onImportClick() {
             label: 'Download Chub expressions',
             tooltip: 'Also download expression sprites for Chub characters that have an expression pack',
             defaultState: settings.downloadExpressions,
+        }, {
+            id: ASSETS_CHECKBOX_ID,
+            label: 'Save gallery & card images locally',
+            tooltip: 'Download the Chub gallery and images linked in the card text into the character\'s gallery folder, and point the card at the local copies',
+            defaultState: settings.localizeAssets,
         }],
     });
     const input = await popup.show();
@@ -894,6 +1325,12 @@ async function onImportClick() {
         settings.downloadExpressions = downloadExpressions;
         saveSettingsDebounced();
         $('#dupe_link_skip_expressions_default').prop('checked', downloadExpressions);
+    }
+    const localizeAssets = !!popup.inputResults?.get(ASSETS_CHECKBOX_ID);
+    if (settings.localizeAssets !== localizeAssets) {
+        settings.localizeAssets = localizeAssets;
+        saveSettingsDebounced();
+        $('#dupe_link_skip_assets_default').prop('checked', localizeAssets);
     }
 
     const inputs = String(input).split('\n').map(x => x.trim()).filter(x => x.length > 0);
@@ -954,16 +1391,7 @@ async function onImportClick() {
             index[added.avatar] = hash !== undefined ? { key, hash } : { key };
             await sourceCache.setItem('index', index);
 
-            if (downloadExpressions && key.startsWith('chub:')) {
-                try {
-                    const full = added.shallow ? await fetchFullCharacter(added.avatar) : added;
-                    await importChubExpressions(full, full.data?.extensions?.chub);
-                    await markExpressionsChecked(added.avatar);
-                } catch (error) {
-                    console.error('[Dupe Link Skip] Could not download expressions for', added.avatar, error);
-                    toastr.warning(`Could not download expressions for ${added.name}.`, 'Import Characters');
-                }
-            }
+            await importAssets(added, { isChub: key.startsWith('chub:'), downloadExpressions, localizeAssets });
         }
     }
 
@@ -996,7 +1424,7 @@ eventSource.on(event_types.CHARACTER_RENAMED, async (oldAvatar, newAvatar) => {
         override.name = avatarFolder(newAvatar);
         saveSettingsDebounced();
     }
-    for (const key of ['packs', 'expressionsChecked']) {
+    for (const key of ['packs', 'expressionsChecked', 'assetsChecked', 'assetLinks']) {
         const map = (await sourceCache.getItem(key)) ?? {};
         if (map[oldAvatar] === undefined) continue;
         map[newAvatar] = map[oldAvatar];

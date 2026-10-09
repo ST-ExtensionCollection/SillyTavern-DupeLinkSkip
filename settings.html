@@ -35,19 +35,44 @@
                 Packs go into the character's sprite folder, or a "chub" subfolder if it already has sprites. Alternate packs go into subfolders named after their version. Images already present are skipped.
                 A downloaded pack becomes the character's Sprite Folder Override unless it already uses other sprites; switch between packs with the Outfit dropdown in the Expressions settings.
             </small>
-            <label class="checkbox_label" for="dupe_link_skip_expr_added" title="Fetch Chub expressions normally only handles cards that were saved with a pack. With this on, it also asks Chub about every other Chub card, in case a pack was added after you imported it. One request per card, so it's slow on large libraries.">
+            <label class="checkbox_label" for="dupe_link_skip_expr_added" title="Fetching expressions normally only handles cards that were saved with a pack. With this on, it also asks Chub about every other Chub card, in case a pack was added after you imported it. One request per card, so it's slow on large libraries.">
                 <input type="checkbox" id="dupe_link_skip_expr_added">
                 <span>Also check Chub for added packs</span>
             </label>
+            <label class="checkbox_label" for="dupe_link_skip_assets_default" title="Download the Chub gallery and images linked in the card text (greetings, notes, description...) into the character's gallery folder. The card text is pointed at the local copies, with each original link kept in a \{{// original: ... }} comment.">
+                <input type="checkbox" id="dupe_link_skip_assets_default">
+                <span>Save gallery &amp; card images locally by default</span>
+            </label>
+            <small>
+                Images are saved in the character's own gallery folder (named after its avatar file), which also becomes its gallery folder unless it already uses another. Duplicate detection keeps using the card's original content.
+            </small>
+            <hr>
+            <b>Fetch assets for existing characters</b>
+            <div class="flex-container">
+                <label class="checkbox_label" for="dupe_link_skip_part_expressions"><input type="checkbox" id="dupe_link_skip_part_expressions"><span>Chub expressions</span></label>
+                <label class="checkbox_label" for="dupe_link_skip_part_gallery"><input type="checkbox" id="dupe_link_skip_part_gallery"><span>Chub gallery</span></label>
+                <label class="checkbox_label" for="dupe_link_skip_part_images"><input type="checkbox" id="dupe_link_skip_part_images"><span>Card images</span></label>
+                <label class="checkbox_label" for="dupe_link_skip_part_links"><input type="checkbox" id="dupe_link_skip_part_links"><span>Asset links</span></label>
+            </div>
             <div class="flex-container marginTop5">
-                <div id="dupe_link_skip_expr_fetch" class="menu_button" title="Download expression packs for Chub characters already in your library. Runs slowly in the background; characters already checked are skipped.">
-                    <i class="fa-solid fa-face-smile"></i> Fetch Chub expressions
+                <div id="dupe_link_skip_expr_fetch" class="menu_button" title="Run the checked parts for every character in your library. Runs slowly in the background; parts already done for a character are skipped.">
+                    <i class="fa-solid fa-download"></i> Fetch assets
                 </div>
                 <div id="dupe_link_skip_relink" class="menu_button" title="Find downloaded packs and point each character's Sprite Folder Override at them. Characters that already use other sprites are left alone. Runs automatically once.">
                     <i class="fa-solid fa-link"></i> Re-link sprite packs
                 </div>
             </div>
             <small id="dupe_link_skip_expr_status"></small>
+            <div id="dupe_link_skip_links_drawer" class="inline-drawer marginTop5">
+                <div class="inline-drawer-toggle inline-drawer-header">
+                    <span>Characters with asset links (<span id="dupe_link_skip_links_count">0</span>)</span>
+                    <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                </div>
+                <div class="inline-drawer-content">
+                    <small>Links in creator notes that look like extra sprite packs, archives or file hosts. These characters also get the "Asset links" tag.</small>
+                    <div id="dupe_link_skip_links_list"></div>
+                </div>
+            </div>
         </div>
     </div>
 </div>
