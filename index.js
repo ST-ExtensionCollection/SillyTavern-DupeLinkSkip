@@ -5,7 +5,7 @@ import { renderTemplateAsync } from '/scripts/templates.js';
 import { debounce, getBase64Async, getStringHash, importFromExternalUrl, isValidUrl, uuidv4 } from '/scripts/utils.js';
 import { addTagsToEntity, removeTagFromEntity, tags, TAG_FOLDER_DEFAULT_TYPE } from '/scripts/tags.js';
 import { selected_group } from '/scripts/group-chats.js';
-import { importWorldInfo } from '/scripts/world-info.js';
+import { importWorldInfo, world_info, world_names } from '/scripts/world-info.js';
 
 const MODULE = 'dupeLinkSkip';
 const EXTENSION_PATH = 'third-party/SillyTavern-DupeLinkSkip';
@@ -56,6 +56,9 @@ function getSettings() {
     settings.backfillParts.gallery ??= true;
     settings.backfillParts.images ??= true;
     settings.backfillParts.links ??= true;
+    settings.backfillParts.lorebooks ??= true;
+    // Download lorebooks a Chub card links to, and attach them to the character
+    settings.downloadLorebooks ??= true;
     // Map of normalized source key -> avatar file name, for imports whose
     // source ST doesn't store on the card (JanitorAI, generic PNG links, etc).
     settings.imported ??= {};
@@ -741,6 +744,89 @@ async function importChubGallery(character, { gap = 0 } = {}) {
     return added;
 }
 
+/**
+ * Chub lorebooks already downloaded: lowercase "creator/slug" -> world name.
+ * Lets several characters linking the same book share one copy.
+ * @returns {Promise<Record<string, string>>}
+ */
+async function loadLorebooks() {
+    return (await sourceCache.getItem('lorebooks')) ?? {};
+}
+
+/**
+ * Downloads the lorebooks a Chub card links to (extensions.chub.related_lorebooks)
+ * and attaches them to the character. A book is downloaded only once: later
+ * characters reuse it, as do books already in ST under the name ST's Chub
+ * importer gives them (the URL slug).
+ * @param {any} character Full character
+ * @returns {Promise<number>} Lorebooks downloaded
+ */
+async function importChubLorebooks(character) {
+    const related = character.data?.extensions?.chub?.related_lorebooks;
+    if (!Array.isArray(related) || !related.length) return 0;
+
+    const known = await loadLorebooks();
+    const names = [];
+    let added = 0;
+    for (const book of related) {
+        const path = String(book?.path ?? '').replace(/^\/?lorebooks\//, '');
+        if (!path.includes('/')) continue;
+        const key = path.toLowerCase();
+        let name = known[key];
+
+        if (!name || !world_names.includes(name)) {
+            const slug = path.split('/').pop();
+            if (world_names.includes(slug)) {
+                name = slug;
+            } else {
+                const download = await downloadExternal(`https://chub.ai/lorebooks/${path}`, { quiet: true });
+                if (download?.type !== 'lorebook') throw new Error(`Could not download lorebook ${path}`);
+                const before = new Set(world_names);
+                await importWorldInfo(download.file);
+                name = world_names.find(n => !before.has(n));
+                if (!name) throw new Error(`Lorebook ${path} was not imported`);
+                added++;
+                await sleep(1000);
+            }
+            known[key] = name;
+            await sourceCache.setItem('lorebooks', known);
+        }
+        if (!names.includes(name)) names.push(name);
+    }
+
+    await linkLorebooks(character, names);
+    if (added) toastr.success(`${added} lorebook${added === 1 ? '' : 's'}`, `Imported Lorebooks for ${avatarFolder(character.avatar)}`);
+    return added;
+}
+
+/**
+ * Attaches lorebooks to a character the way ST does: the first becomes its
+ * primary lorebook if it has none, the rest go in its additional lorebooks.
+ * @param {any} character Full character
+ * @param {string[]} names World names
+ */
+async function linkLorebooks(character, names) {
+    const primary = character.data?.extensions?.world;
+    let rest = names.filter(n => n !== primary);
+    if (!primary && rest.length) {
+        await mergeCharacter(character.avatar, { extensions: { world: rest[0] } });
+        rest = rest.slice(1);
+    }
+    if (!rest.length) return;
+
+    const fileName = avatarFolder(character.avatar);
+    world_info.charLore ??= [];
+    let entry = world_info.charLore.find(e => e.name === fileName);
+    if (!entry) {
+        entry = { name: fileName, extraBooks: [] };
+        world_info.charLore.push(entry);
+    }
+    for (const name of rest) {
+        if (!entry.extraBooks.includes(name)) entry.extraBooks.push(name);
+    }
+    saveSettingsDebounced();
+}
+
 const TEXT_FIELDS = [
     'description', 'personality', 'scenario', 'first_mes', 'mes_example', 'creator_notes',
     'system_prompt', 'post_history_instructions',
@@ -1106,8 +1192,8 @@ async function markExpressionsChecked(avatar) {
 }
 
 /**
- * avatar -> which other parts (gallery, images, links) have been done, with timestamps.
- * @returns {Promise<Record<string, {gallery?: number, images?: number, links?: number}>>}
+ * avatar -> which other parts (gallery, lorebooks, images, links) have been done, with timestamps.
+ * @returns {Promise<Record<string, {gallery?: number, lorebooks?: number, images?: number, links?: number}>>}
  */
 async function loadAssetsChecked() {
     return (await sourceCache.getItem('assetsChecked')) ?? {};
@@ -1155,15 +1241,16 @@ async function backfillAssets(job, onStatus) {
             gallery: parts.gallery && isChub && !done.gallery,
             images: parts.images && !done.images,
             links: parts.links && !done.links,
+            lorebooks: parts.lorebooks && isChub && !done.lorebooks,
         };
     };
     const queue = characters.filter(c => Object.values(pendingParts(c)).some(Boolean));
     const total = queue.length;
-    const result = { done: 0, total, sprites: 0, gallery: 0, images: 0, imagesFailed: 0, links: 0, failed: 0 };
+    const result = { done: 0, total, sprites: 0, gallery: 0, images: 0, imagesFailed: 0, links: 0, lorebooks: 0, failed: 0 };
 
     for (const character of queue) {
         if (job.stop) break;
-        onStatus(`Fetching assets... ${result.done} / ${total} (sprites ${result.sprites}, gallery ${result.gallery}, images ${result.images}, links ${result.links})`);
+        onStatus(`Fetching assets... ${result.done} / ${total} (sprites ${result.sprites}, gallery ${result.gallery}, lorebooks ${result.lorebooks}, images ${result.images}, links ${result.links})`);
         const pending = pendingParts(character);
         let usedChub = false;
         try {
@@ -1196,6 +1283,13 @@ async function backfillAssets(job, onStatus) {
                 result.gallery += await importChubGallery(full, { gap: 250 });
                 usedChub = true;
                 done.gallery = Date.now();
+            }
+
+            if (pending.lorebooks) {
+                const count = await importChubLorebooks(full);
+                result.lorebooks += count;
+                if (count) usedChub = true;
+                done.lorebooks = Date.now();
             }
 
             if (pending.images) {
@@ -1240,7 +1334,7 @@ async function onAssetsClick() {
     button.html('<i class="fa-solid fa-stop"></i> Stop');
     try {
         const r = await backfillAssets(job, text => status.text(text));
-        const summary = `Processed ${r.done} / ${r.total} characters: ${r.sprites} sprites, ${r.gallery} gallery images, ` +
+        const summary = `Processed ${r.done} / ${r.total} characters: ${r.sprites} sprites, ${r.gallery} gallery images, ${r.lorebooks} lorebooks, ` +
             `${r.images} card images saved` + (r.imagesFailed ? ` (${r.imagesFailed} couldn't be downloaded)` : '') +
             `, ${r.links} asset links found` + (r.failed ? `, ${r.failed} characters failed (will retry next run)` : '') + '.';
         status.text(summary);
@@ -1324,7 +1418,13 @@ async function addSettingsPanel() {
             getSettings().localizeAssets = !!$(this).prop('checked');
             saveSettingsDebounced();
         });
-    for (const part of ['expressions', 'gallery', 'images', 'links']) {
+    $('#dupe_link_skip_lorebooks_default')
+        .prop('checked', getSettings().downloadLorebooks)
+        .on('change', function () {
+            getSettings().downloadLorebooks = !!$(this).prop('checked');
+            saveSettingsDebounced();
+        });
+    for (const part of ['expressions', 'gallery', 'lorebooks', 'images', 'links']) {
         $(`#dupe_link_skip_part_${part}`)
             .prop('checked', getSettings().backfillParts[part])
             .on('change', function () {
@@ -1384,6 +1484,12 @@ async function importAssets(character, { isChub, downloadExpressions, localizeAs
         await step('download the Chub gallery', async () => {
             await importChubGallery(full);
             await markAssetsChecked(character.avatar, ['gallery']);
+        });
+    }
+    if (isChub && getSettings().downloadLorebooks) {
+        await step('download linked lorebooks', async () => {
+            await importChubLorebooks(full);
+            await markAssetsChecked(character.avatar, ['lorebooks']);
         });
     }
     if (localizeAssets) {

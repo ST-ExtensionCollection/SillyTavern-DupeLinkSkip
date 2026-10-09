@@ -43,6 +43,10 @@
                 <input type="checkbox" id="dupe_link_skip_expr_added">
                 <span>Also check Chub for added packs</span>
             </label>
+            <label class="checkbox_label" for="dupe_link_skip_lorebooks_default" title="Download lorebooks a Chub card links to and attach them to the character: as its primary lorebook if it has none, otherwise as an additional lorebook. Each book is downloaded once and shared by every character linking it; books already in ST under their Chub name are reused.">
+                <input type="checkbox" id="dupe_link_skip_lorebooks_default">
+                <span>Download linked Chub lorebooks on import</span>
+            </label>
             <label class="checkbox_label" for="dupe_link_skip_assets_default" title="Download the Chub gallery and images linked in the card text (greetings, notes, description...) into the character's gallery folder. The card text is pointed at the local copies, with each original link kept in a \{{// original: ... }} comment.">
                 <input type="checkbox" id="dupe_link_skip_assets_default">
                 <span>Save gallery &amp; card images locally by default</span>
@@ -55,6 +59,7 @@
             <div class="flex-container">
                 <label class="checkbox_label" for="dupe_link_skip_part_expressions"><input type="checkbox" id="dupe_link_skip_part_expressions"><span>Chub expressions</span></label>
                 <label class="checkbox_label" for="dupe_link_skip_part_gallery"><input type="checkbox" id="dupe_link_skip_part_gallery"><span>Chub gallery</span></label>
+                <label class="checkbox_label" for="dupe_link_skip_part_lorebooks"><input type="checkbox" id="dupe_link_skip_part_lorebooks"><span>Chub lorebooks</span></label>
                 <label class="checkbox_label" for="dupe_link_skip_part_images"><input type="checkbox" id="dupe_link_skip_part_images"><span>Card images</span></label>
                 <label class="checkbox_label" for="dupe_link_skip_part_links"><input type="checkbox" id="dupe_link_skip_part_links"><span>Asset links</span></label>
             </div>
