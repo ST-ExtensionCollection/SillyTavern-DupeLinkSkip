@@ -251,6 +251,8 @@ async function fetchFullCharacter(avatar) {
 }
 
 class RateLimitError extends Error {}
+// Saving to ST failed (e.g. disk full), as opposed to the remote file being unavailable
+class LocalSaveError extends Error {}
 
 /**
  * @param {any} chub The card's extensions.chub
@@ -543,22 +545,29 @@ async function importChubExpressions(character, chub, { gap = 0 } = {}) {
     const root = avatarFolder(character.avatar);
     const writtenFolders = [];
     const knownHashes = new Set();
+    /** @returns {Promise<Set<string>>} Hashes of these sprites (also added to knownHashes) */
     const hashSprites = async (sprites) => {
+        const hashes = new Set();
         for (const sprite of sprites) {
             try {
-                knownHashes.add(await blobHash(await fetchBlob(sprite.path)));
+                hashes.add(await blobHash(await fetchBlob(sprite.path)));
             } catch (error) {
                 console.warn('[Dupe Link Skip] Could not read sprite', sprite.path, error);
             }
         }
+        hashes.forEach(h => knownHashes.add(h));
+        return hashes;
     };
 
     const rootSprites = await getSprites(root);
-    await hashSprites(rootSprites);
+    const rootHashes = await hashSprites(rootSprites);
+    // Sprites in the main folder that came from an earlier, interrupted download of this pack don't count
+    const ownFolders = (await loadPacks())[character.avatar]?.folders ?? [];
+    const rootTaken = rootSprites.length > 0 && !ownFolders.includes(root);
     let written = 0;
 
     for (const { pack, sub } of packs) {
-        const folder = packFolder(root, sub, rootSprites.length > 0);
+        const folder = packFolder(root, sub, rootTaken);
         const entries = Object.entries(pack.expressions ?? {})
             .filter(([, url]) => typeof url === 'string' && url && !CHUB_STOCK_EXPRESSIONS.test(url));
 
@@ -573,10 +582,11 @@ async function importChubExpressions(character, chub, { gap = 0 } = {}) {
         }
 
         const existing = folder === root ? rootSprites : await getSprites(folder);
-        if (folder !== root) await hashSprites(existing);
+        const folderHashes = folder === root ? rootHashes : await hashSprites(existing);
         const taken = new Set(existing.map(s => s.label));
-        // Packs reuse one image for several labels, so only skip images that came from elsewhere
-        const ownHashes = new Set();
+        // Packs reuse one image for several labels, so only skip images that came from elsewhere.
+        // A folder this pack was already being downloaded into counts as its own.
+        const ownHashes = ownFolders.includes(folder) ? new Set(folderHashes) : new Set();
 
         for (const [label, url] of entries) {
             if (taken.has(label.toLowerCase())) continue;
@@ -584,6 +594,8 @@ async function importChubExpressions(character, chub, { gap = 0 } = {}) {
             if (gap) await sleep(gap);
             const hash = await blobHash(blob);
             if (knownHashes.has(hash) && !ownHashes.has(hash)) continue;
+            // Record the folder before writing, so an interrupted download resumes into the same folder
+            if (!writtenFolders.includes(folder) && !ownFolders.includes(folder)) await recordPackFolders(character.avatar, [folder]);
             await uploadSprite(folder, label, blob, url);
             ownHashes.add(hash);
             knownHashes.add(hash);
@@ -671,7 +683,7 @@ async function saveGalleryImage(folder, prefix, blob, url, existing) {
         headers: getRequestHeaders(),
         body: JSON.stringify({ image, format, filename: name, ch_name: folder }),
     });
-    if (!response.ok) throw new Error(`Image upload failed: ${response.status} ${response.statusText}`);
+    if (!response.ok) throw new LocalSaveError(`Image upload failed: ${response.status} ${response.statusText}`);
     existing.add(`${name}.${format}`);
     return { path: path(`${name}.${format}`), isNew: true };
 }
@@ -731,13 +743,33 @@ async function importChubGallery(character, { gap = 0 } = {}) {
     const urls = await fetchChubGallery(projectId);
     if (!urls.length) return 0;
 
+    // Gallery URLs saved before (kept on the card): skipped without downloading,
+    // even if the file was deleted since, so removed pictures stay removed
+    const ext = character.data?.extensions?.dupe_link_skip ?? {};
+    const savedUrls = { ...(ext.gallery ?? {}) };
+    const pending = urls.filter(url => !savedUrls[url]);
+    if (!pending.length) return 0;
+
     const folder = avatarFolder(character.avatar);
     const existing = new Set(await listGalleryImages(folder));
-    let added = 0;
-    for (const url of urls) {
-        const saved = await saveGalleryImage(folder, 'chub', await fetchExternal(url), url, existing);
-        if (saved?.isNew) added++;
-        if (gap) await sleep(gap);
+    let added = 0, recorded = 0;
+    try {
+        for (const url of pending) {
+            const saved = await saveGalleryImage(folder, 'chub', await fetchExternal(url), url, existing);
+            if (saved) {
+                savedUrls[url] = saved.path;
+                recorded++;
+            }
+            if (saved?.isNew) added++;
+            if (gap) await sleep(gap);
+        }
+    } finally {
+        // Also runs when a download fails partway, so a retry skips what's already saved
+        if (recorded) {
+            await mergeCharacter(character.avatar, {
+                extensions: { dupe_link_skip: { content_hash: ext.content_hash || contentHash(character), gallery: savedUrls } },
+            });
+        }
     }
     await associateGallery(character);
     if (added) toastr.success(`${added} image${added === 1 ? '' : 's'}`, `Imported Gallery for ${folder}`);
@@ -858,18 +890,40 @@ async function localizeImages(character, { gap = 0 } = {}) {
     /** @type {Record<string, string>} */
     const local = {};
     let failed = 0;
+    /** @type {Error|null} */
+    let saveError = null;
+    // URLs saved before (kept on the card) reuse that file without downloading
+    const savedUrls = data.extensions?.dupe_link_skip?.images ?? {};
+    let downloaded = 0;
     for (const url of urls) {
+        if (savedUrls[url]) {
+            local[url] = savedUrls[url];
+            continue;
+        }
         try {
             const saved = await saveGalleryImage(folder, 'embed', await fetchExternal(url), url, existing);
-            if (saved) local[url] = saved.path; else failed++;
+            if (saved) {
+                local[url] = saved.path;
+                downloaded++;
+            } else {
+                failed++;
+            }
         } catch (error) {
             if (error instanceof RateLimitError) throw error;
             console.warn('[Dupe Link Skip] Could not save image', url, error);
             failed++;
+            // ST couldn't store it; no point trying the rest now
+            if (error instanceof LocalSaveError) {
+                saveError = error;
+                break;
+            }
         }
         if (gap) await sleep(gap);
     }
-    if (!Object.keys(local).length) return { saved: 0, failed };
+    if (!Object.keys(local).length) {
+        if (saveError) throw saveError;
+        return { saved: 0, failed };
+    }
 
     const rewrite = (text) => String(text ?? '').replace(EMBEDDED_IMAGE, (match, mdStart, mdUrl, mdRest, imgStart, imgUrl, imgRest) => {
         const url = mdUrl ?? imgUrl;
@@ -897,8 +951,10 @@ async function localizeImages(character, { gap = 0 } = {}) {
     });
     await associateGallery(character);
 
-    const saved = Object.keys(local).length;
-    toastr.success(`${saved} image${saved === 1 ? '' : 's'}` + (failed ? `, ${failed} failed` : ''), `Saved Card Images for ${folder}`);
+    const saved = downloaded;
+    if (saved || failed) toastr.success(`${saved} image${saved === 1 ? '' : 's'}` + (failed ? `, ${failed} failed` : ''), `Saved Card Images for ${folder}`);
+    // Images saved so far are linked; throwing leaves the card unchecked so the rest are retried
+    if (saveError) throw saveError;
     return { saved, failed };
 }
 
@@ -1316,6 +1372,28 @@ async function backfillAssets(job, onStatus) {
     return result;
 }
 
+/**
+ * Clears the "card images done" mark on every character, so the next Fetch
+ * assets retries images that couldn't be saved. Cards whose images are all
+ * local already have no remote links left, so they're quick to recheck.
+ */
+async function onRetryImagesClick() {
+    if (assetJob) {
+        toastr.warning('Stop the running job first.', 'Dupe Link Skip');
+        return;
+    }
+    const checked = await loadAssetsChecked();
+    let count = 0;
+    for (const entry of Object.values(checked)) {
+        if (entry.images) {
+            delete entry.images;
+            count++;
+        }
+    }
+    await sourceCache.setItem('assetsChecked', checked);
+    toastr.info(`${count} characters will have their card images rechecked. Click Fetch assets with Card images checked.`, 'Dupe Link Skip');
+}
+
 async function onAssetsClick() {
     const button = $('#dupe_link_skip_expr_fetch');
     const status = $('#dupe_link_skip_expr_status');
@@ -1433,6 +1511,7 @@ async function addSettingsPanel() {
             });
     }
     $('#dupe_link_skip_expr_fetch').on('click', () => onAssetsClick());
+    $('#dupe_link_skip_retry_images').on('click', () => onRetryImagesClick());
     $('#dupe_link_skip_links_drawer .inline-drawer-toggle').on('click', () => renderAssetLinks());
     $('#dupe_link_skip_blacklist')
         .val(getSettings().linkBlacklist.join('\n'))
