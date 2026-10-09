@@ -9,6 +9,7 @@ const MODULE = 'dupeLinkSkip';
 const EXTENSION_PATH = 'third-party/SillyTavern-DupeLinkSkip';
 const IMPORT_SELECTOR = '.external_import_button, #external_import_button';
 const CHECKBOX_ID = 'dupe_link_skip_prevent';
+const EXPRESSIONS_CHECKBOX_ID = 'dupe_link_skip_expressions';
 const FETCH_CONCURRENCY = 6;
 
 // Cache of avatar -> { key, hash } (source key and content hash, '' = none).
@@ -17,6 +18,10 @@ const FETCH_CONCURRENCY = 6;
 const sourceCache = localforage.createInstance({ name: 'SillyTavern_DupeLinkSkip' });
 /** @type {Promise<void>|null} */
 let refreshPromise = null;
+/** @type {{stop: boolean}|null} */
+let expressionJob = null;
+// Set if the browser can't reach Chub's API directly (CORS); then go through ST's server
+let chubApiBlocked = false;
 
 function getSettings() {
     if (!extension_settings[MODULE]) {
@@ -25,6 +30,9 @@ function getSettings() {
     const settings = extension_settings[MODULE];
     settings.preventDuplicates ??= true;
     settings.contentCheck ??= false;
+    settings.downloadExpressions ??= true;
+    // Backfill also asks Chub about cards stored without a pack, in case one was added since
+    settings.checkAddedPacks ??= false;
     // Map of normalized source key -> avatar file name, for imports whose
     // source ST doesn't store on the card (JanitorAI, generic PNG links, etc).
     settings.imported ??= {};
@@ -157,9 +165,10 @@ async function readCardFromFile(file) {
 /**
  * Downloads content the same way ST's importFromExternalUrl does, without importing it.
  * @param {string} url
+ * @param {{quiet?: boolean}} [options] quiet: no toast on failure
  * @returns {Promise<{file: File, type: string}|null>}
  */
-async function downloadExternal(url) {
+async function downloadExternal(url, { quiet = false } = {}) {
     const endpoint = isValidUrl(url) ? '/api/content/importURL' : '/api/content/importUUID';
     const request = await fetch(endpoint, {
         method: 'POST',
@@ -168,7 +177,7 @@ async function downloadExternal(url) {
     });
 
     if (!request.ok) {
-        toastr.info(request.statusText, 'Custom content import failed');
+        if (!quiet) toastr.info(request.statusText, 'Custom content import failed');
         console.error('Custom content import failed', request.status, request.statusText);
         return null;
     }
@@ -210,6 +219,180 @@ async function fetchFullCharacter(avatar) {
     });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     return response.json();
+}
+
+class RateLimitError extends Error {}
+
+/**
+ * @param {any} chub The card's extensions.chub
+ * @returns {{pack: any, sub: string|null}[]} Default pack (sub null) and alt packs
+ */
+function chubPacks(chub) {
+    const packs = [];
+    if (chub?.expressions) packs.push({ pack: chub.expressions, sub: null });
+    for (const [version, pack] of Object.entries(chub?.alt_expressions ?? {})) {
+        if (pack) packs.push({ pack, sub: version });
+    }
+    return packs;
+}
+
+/**
+ * Gets a character's current extensions.chub from Chub, so packs added or
+ * changed since import are seen.
+ * @param {string} fullPath "creator/slug"
+ * @returns {Promise<any|null>} extensions.chub, or null if Chub no longer has the character
+ */
+async function fetchChubExtension(fullPath) {
+    if (!chubApiBlocked) {
+        try {
+            const path = fullPath.split('/').map(encodeURIComponent).join('/');
+            const response = await fetch(`https://api.chub.ai/api/characters/${path}?full=true`, { cache: 'no-cache' });
+            if (response.status === 429) throw new RateLimitError('429 from Chub API');
+            if (response.status === 404) return null;
+            if (!response.ok) throw new Error(`Chub API: ${response.status} ${response.statusText}`);
+            return (await response.json())?.node?.definition?.extensions?.chub ?? null;
+        } catch (error) {
+            if (!(error instanceof TypeError)) throw error;
+            console.warn('[Dupe Link Skip] Chub API not reachable from browser, using ST server instead', error);
+            chubApiBlocked = true;
+        }
+    }
+
+    const download = await downloadExternal(`https://chub.ai/characters/${fullPath}`, { quiet: true });
+    if (!download) return null;
+    return (await readCardFromFile(download.file))?.data?.extensions?.chub ?? null;
+}
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+// Chub's stock placeholder images, used for packs that don't define every label
+const CHUB_STOCK_EXPRESSIONS = /lfs\.charhub\.io\/lfs\/88\/emotions\//;
+
+async function fetchBlob(url) {
+    const response = await fetch(url, { cache: 'no-cache' });
+    if (response.status === 429) throw new RateLimitError(`429 from ${url}`);
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText} from ${url}`);
+    return response.blob();
+}
+
+async function blobHash(blob) {
+    const digest = await crypto.subtle.digest('SHA-1', await blob.arrayBuffer());
+    return Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * @param {string} folder Sprite folder, optionally "character/subfolder"
+ * @returns {Promise<{label: string, path: string}[]>}
+ */
+async function getSprites(folder) {
+    const response = await fetch(`/api/sprites/get?name=${encodeURIComponent(folder)}`, {
+        headers: getRequestHeaders(),
+        cache: 'no-cache',
+    });
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+    return response.json();
+}
+
+async function uploadSprite(folder, label, blob, url) {
+    const ext = new URL(url).pathname.match(/\.[a-z0-9]+$/i)?.[0] ?? '.png';
+    const formData = new FormData();
+    formData.append('name', folder);
+    formData.append('label', label);
+    formData.append('avatar', new File([blob], `${label}${ext}`, { type: blob.type }));
+    formData.append('spriteName', label);
+    const response = await fetch('/api/sprites/upload', {
+        method: 'POST',
+        headers: getRequestHeaders({ omitContentType: true }),
+        body: formData,
+        cache: 'no-cache',
+    });
+    if (!response.ok) throw new Error(`Sprite upload failed: ${response.status} ${response.statusText}`);
+}
+
+async function uploadSpriteZip(folder, blob) {
+    const formData = new FormData();
+    formData.append('name', folder);
+    formData.append('avatar', new File([blob], 'expressions.zip', { type: 'application/zip' }));
+    const response = await fetch('/api/sprites/upload-zip', {
+        method: 'POST',
+        headers: getRequestHeaders({ omitContentType: true }),
+        body: formData,
+        cache: 'no-cache',
+    });
+    if (!response.ok) throw new Error(`Sprite zip upload failed: ${response.status} ${response.statusText}`);
+    return (await response.json()).count ?? 0;
+}
+
+/**
+ * Downloads a character's Chub expression packs (stored on the card under
+ * extensions.chub) into its sprite folder. The default pack goes in the main
+ * folder, or a "chub" subfolder if the character already has sprites; alt
+ * packs go in subfolders named after their version. Images already present
+ * (same bytes) and Chub's stock placeholders are skipped, and nothing is
+ * overwritten.
+ * @param {string} avatar Character avatar file name
+ * @param {any} chub The card's extensions.chub
+ * @param {{gap?: number}} [options] gap: delay in ms between image downloads
+ * @returns {Promise<number>} Number of sprites written
+ */
+async function importChubExpressions(avatar, chub, { gap = 0 } = {}) {
+    const packs = chubPacks(chub);
+    if (!packs.length) return 0;
+
+    const root = avatar.replace(/\.[^/.]+$/, '');
+    const knownHashes = new Set();
+    const hashSprites = async (sprites) => {
+        for (const sprite of sprites) {
+            try {
+                knownHashes.add(await blobHash(await fetchBlob(sprite.path)));
+            } catch (error) {
+                console.warn('[Dupe Link Skip] Could not read sprite', sprite.path, error);
+            }
+        }
+    };
+
+    const rootSprites = await getSprites(root);
+    await hashSprites(rootSprites);
+    let written = 0;
+
+    for (const { pack, sub } of packs) {
+        const folderName = (sub ?? (rootSprites.length ? 'chub' : '')).replace(/[\\/]/g, '_');
+        const folder = folderName ? `${root}/${folderName}` : root;
+        const entries = Object.entries(pack.expressions ?? {})
+            .filter(([, url]) => typeof url === 'string' && url && !CHUB_STOCK_EXPRESSIONS.test(url));
+
+        if (!entries.length) {
+            // Labels unlisted; fall back to the pack's zip if it has one
+            if (pack.compressed && !Object.keys(pack.expressions ?? {}).length && !(await getSprites(folder)).length) {
+                written += await uploadSpriteZip(folder, await fetchBlob(pack.compressed));
+            }
+            continue;
+        }
+
+        const existing = folder === root ? rootSprites : await getSprites(folder);
+        if (folder !== root) await hashSprites(existing);
+        const taken = new Set(existing.map(s => s.label));
+        // Packs reuse one image for several labels, so only skip images that came from elsewhere
+        const ownHashes = new Set();
+
+        for (const [label, url] of entries) {
+            if (taken.has(label.toLowerCase())) continue;
+            const blob = await fetchBlob(url);
+            if (gap) await sleep(gap);
+            const hash = await blobHash(blob);
+            if (knownHashes.has(hash) && !ownHashes.has(hash)) continue;
+            await uploadSprite(folder, label, blob, url);
+            ownHashes.add(hash);
+            knownHashes.add(hash);
+            taken.add(label.toLowerCase());
+            written++;
+        }
+    }
+
+    if (written) {
+        toastr.success(`${written} sprite${written === 1 ? '' : 's'}`, `Imported Expression Pack for ${root}`);
+    }
+    return written;
 }
 
 /**
@@ -315,6 +498,118 @@ async function getExisting() {
     return { keys, hashes };
 }
 
+/**
+ * avatar -> when its Chub expressions were checked. remote: false means only
+ * the stored card was read (no pack on it), so it's re-checked when
+ * checkAddedPacks is on. Plain numbers are from imports, which are always fresh.
+ * @returns {Promise<Record<string, number|{t: number, remote: boolean}>>}
+ */
+async function loadExpressionsChecked() {
+    return (await sourceCache.getItem('expressionsChecked')) ?? {};
+}
+
+async function markExpressionsChecked(avatar) {
+    const checked = await loadExpressionsChecked();
+    checked[avatar] = { t: Date.now(), remote: true };
+    await sourceCache.setItem('expressionsChecked', checked);
+}
+
+/**
+ * Downloads Chub expression packs for every Chub character not checked yet.
+ * Runs one character at a time with pauses, so it can be left in the background.
+ * @param {{stop: boolean}} job
+ * @param {(text: string) => void} onStatus
+ */
+async function backfillExpressions(job, onStatus) {
+    const { index } = await loadIndex();
+    const checked = await loadExpressionsChecked();
+    const avatars = new Set(characters.map(c => c.avatar));
+    for (const avatar of Object.keys(checked)) {
+        if (!avatars.has(avatar)) delete checked[avatar];
+    }
+
+    const checkAdded = getSettings().checkAddedPacks;
+    const isDone = (entry) => entry && (!checkAdded || typeof entry === 'number' || entry.remote);
+    const queue = characters.filter(c => !isDone(checked[c.avatar]) && (c.shallow
+        ? index[c.avatar]?.key?.startsWith('chub:')
+        : c.data?.extensions?.chub));
+    const total = queue.length;
+    let done = 0, written = 0, withSprites = 0, failed = 0;
+
+    for (const character of queue) {
+        if (job.stop) break;
+        onStatus(`Fetching expressions... ${done} / ${total} (${withSprites} with new sprites)`);
+        try {
+            const full = character.shallow ? await fetchFullCharacter(character.avatar) : character;
+            let chub = full.data?.extensions?.chub;
+            const fullPath = chub?.full_path ?? index[character.avatar]?.key?.slice('chub:'.length);
+
+            if (!chubPacks(chub).length && !checkAdded) {
+                checked[character.avatar] = { t: Date.now(), remote: false };
+                done++;
+                continue;
+            }
+
+            // Refresh from Chub first: one request instead of several failed/outdated image downloads
+            if (fullPath) {
+                chub = (await fetchChubExtension(fullPath)) ?? chub;
+                await sleep(1000);
+            }
+
+            const count = await importChubExpressions(character.avatar, chub, { gap: 250 });
+            checked[character.avatar] = { t: Date.now(), remote: true };
+            written += count;
+            if (count) {
+                withSprites++;
+                await sleep(1500);
+            }
+        } catch (error) {
+            console.warn('[Dupe Link Skip] Could not fetch expressions for', character.avatar, error);
+            failed++;
+            if (error instanceof RateLimitError) {
+                onStatus('Rate limited by Chub, waiting a minute...');
+                await sleep(60000);
+            }
+        }
+        done++;
+        if (done % 25 === 0) await sourceCache.setItem('expressionsChecked', checked);
+    }
+
+    await sourceCache.setItem('expressionsChecked', checked);
+    return { done, total, written, withSprites, failed };
+}
+
+async function onExpressionsClick() {
+    const button = $('#dupe_link_skip_expr_fetch');
+    const status = $('#dupe_link_skip_expr_status');
+    if (expressionJob) {
+        expressionJob.stop = true;
+        button.text('Stopping...');
+        return;
+    }
+
+    const { updated } = await loadIndex();
+    if (!updated) {
+        toastr.warning('Characters haven\'t been scanned yet, so only already loaded Chub characters will be checked. Use Load new or Rebuild all first.', 'Dupe Link Skip', { timeOut: 10000 });
+    }
+
+    const job = expressionJob = { stop: false };
+    button.html('<i class="fa-solid fa-stop"></i> Stop');
+    try {
+        const result = await backfillExpressions(job, text => status.text(text));
+        const summary = `Checked ${result.done} / ${result.total} Chub characters: ${result.written} sprites added for ${result.withSprites} characters` +
+            (result.failed ? `, ${result.failed} failed (will retry next run)` : '') + '.';
+        status.text(summary);
+        toastr.success(summary, 'Dupe Link Skip');
+    } catch (error) {
+        console.error('[Dupe Link Skip] Expression fetch failed', error);
+        status.text(`Failed: ${error}`);
+    } finally {
+        expressionJob = null;
+        button.html('<i class="fa-solid fa-face-smile"></i> Fetch Chub expressions');
+    }
+}
+
 async function updateStatus() {
     const { index, updated } = await loadIndex();
     const avatars = new Set(characters.map(c => c.avatar));
@@ -360,6 +655,19 @@ async function addSettingsPanel() {
             getSettings().contentCheck = !!$(this).prop('checked');
             saveSettingsDebounced();
         });
+    $('#dupe_link_skip_expressions_default')
+        .prop('checked', getSettings().downloadExpressions)
+        .on('change', function () {
+            getSettings().downloadExpressions = !!$(this).prop('checked');
+            saveSettingsDebounced();
+        });
+    $('#dupe_link_skip_expr_added')
+        .prop('checked', getSettings().checkAddedPacks)
+        .on('change', function () {
+            getSettings().checkAddedPacks = !!$(this).prop('checked');
+            saveSettingsDebounced();
+        });
+    $('#dupe_link_skip_expr_fetch').on('click', () => onExpressionsClick());
     $('#dupe_link_skip_load_new').on('click', () => onRefreshClick(false));
     $('#dupe_link_skip_rebuild').on('click', () => onRefreshClick(true));
     // Keep status current when the drawer is opened
@@ -380,6 +688,11 @@ async function onImportClick() {
             label: 'Prevent Duplicates',
             tooltip: 'Skip URLs that match a character already in your library',
             defaultState: settings.preventDuplicates,
+        }, {
+            id: EXPRESSIONS_CHECKBOX_ID,
+            label: 'Download Chub expressions',
+            tooltip: 'Also download expression sprites for Chub characters that have an expression pack',
+            defaultState: settings.downloadExpressions,
         }],
     });
     const input = await popup.show();
@@ -394,6 +707,12 @@ async function onImportClick() {
         settings.preventDuplicates = preventDuplicates;
         saveSettingsDebounced();
         $('#dupe_link_skip_default').prop('checked', preventDuplicates);
+    }
+    const downloadExpressions = !!popup.inputResults?.get(EXPRESSIONS_CHECKBOX_ID);
+    if (settings.downloadExpressions !== downloadExpressions) {
+        settings.downloadExpressions = downloadExpressions;
+        saveSettingsDebounced();
+        $('#dupe_link_skip_expressions_default').prop('checked', downloadExpressions);
     }
 
     const inputs = String(input).split('\n').map(x => x.trim()).filter(x => x.length > 0);
@@ -453,6 +772,17 @@ async function onImportClick() {
             // hash stays undefined if not computed, so the next "Load new" fills it in
             index[added.avatar] = hash !== undefined ? { key, hash } : { key };
             await sourceCache.setItem('index', index);
+
+            if (downloadExpressions && key.startsWith('chub:')) {
+                try {
+                    const full = added.shallow ? await fetchFullCharacter(added.avatar) : added;
+                    await importChubExpressions(added.avatar, full.data?.extensions?.chub);
+                    await markExpressionsChecked(added.avatar);
+                } catch (error) {
+                    console.error('[Dupe Link Skip] Could not download expressions for', added.avatar, error);
+                    toastr.warning(`Could not download expressions for ${added.name}.`, 'Import Characters');
+                }
+            }
         }
     }
 

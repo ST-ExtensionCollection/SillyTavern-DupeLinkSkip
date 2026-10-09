@@ -26,6 +26,24 @@
                 </div>
             </div>
             <small id="dupe_link_skip_status"></small>
+            <hr>
+            <label class="checkbox_label" for="dupe_link_skip_expressions_default" title="When importing a Chub character that has an expression pack, download its sprites too. Chub's stock placeholder images are skipped.">
+                <input type="checkbox" id="dupe_link_skip_expressions_default">
+                <span>Download Chub expressions by default</span>
+            </label>
+            <small>
+                Packs go into the character's sprite folder, or a "chub" subfolder if it already has sprites. Alternate packs go into subfolders named after their version. Images already present are skipped.
+            </small>
+            <label class="checkbox_label" for="dupe_link_skip_expr_added" title="Fetch Chub expressions normally only handles cards that were saved with a pack. With this on, it also asks Chub about every other Chub card, in case a pack was added after you imported it. One request per card, so it's slow on large libraries.">
+                <input type="checkbox" id="dupe_link_skip_expr_added">
+                <span>Also check Chub for added packs</span>
+            </label>
+            <div class="flex-container marginTop5">
+                <div id="dupe_link_skip_expr_fetch" class="menu_button" title="Download expression packs for Chub characters already in your library. Runs slowly in the background; characters already checked are skipped.">
+                    <i class="fa-solid fa-face-smile"></i> Fetch Chub expressions
+                </div>
+            </div>
+            <small id="dupe_link_skip_expr_status"></small>
         </div>
     </div>
 </div>
