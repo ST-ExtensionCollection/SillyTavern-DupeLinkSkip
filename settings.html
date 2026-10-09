@@ -35,6 +35,10 @@
                 Packs go into the character's sprite folder, or a "chub" subfolder if it already has sprites. Alternate packs go into subfolders named after their version. Images already present are skipped.
                 A downloaded pack becomes the character's Sprite Folder Override unless it already uses other sprites; switch between packs with the Outfit dropdown in the Expressions settings.
             </small>
+            <label for="dupe_link_skip_expr_tag" title="Tag added to characters that have a downloaded expression pack. Leave empty for no tag. Re-link sprite packs tags characters downloaded earlier.">
+                <small>Tag characters with downloaded packs as</small>
+            </label>
+            <input type="text" id="dupe_link_skip_expr_tag" class="text_pole" placeholder="No tag">
             <label class="checkbox_label" for="dupe_link_skip_expr_added" title="Fetching expressions normally only handles cards that were saved with a pack. With this on, it also asks Chub about every other Chub card, in case a pack was added after you imported it. One request per card, so it's slow on large libraries.">
                 <input type="checkbox" id="dupe_link_skip_expr_added">
                 <span>Also check Chub for added packs</span>

@@ -39,6 +39,8 @@ function getSettings() {
     settings.checkAddedPacks ??= false;
     // Set once packs downloaded before sprite associations existed have been linked
     settings.packsMigrated ??= false;
+    // Tag for characters with a downloaded expression pack ('' = none)
+    settings.expressionsTag ??= 'EXP Downloaded';
     // Save Chub gallery and images embedded in card text locally
     settings.localizeAssets ??= true;
     // Which parts the backfill job runs
@@ -370,6 +372,7 @@ let packsWrite = Promise.resolve();
 
 function recordPackFolders(avatar, folders) {
     if (!folders.length) return packsWrite;
+    tagCharacter(avatar, getSettings().expressionsTag);
     packsWrite = packsWrite.then(async () => {
         const packs = await loadPacks();
         const entry = packs[avatar] ??= { folders: [] };
@@ -855,17 +858,28 @@ async function flagAssetLinks(character) {
     await sourceCache.setItem('assetLinks', links);
     if (!found.length) return 0;
 
-    let tag = tags.find(t => t.name === ASSET_LINKS_TAG);
+    tagCharacter(character.avatar, ASSET_LINKS_TAG);
+    return found.length;
+}
+
+/**
+ * Adds a tag (created if needed) to a character.
+ * @param {string} avatar
+ * @param {string} name Tag name; empty does nothing
+ */
+function tagCharacter(avatar, name) {
+    name = String(name ?? '').trim();
+    if (!name) return;
+    let tag = tags.find(t => t.name.toLowerCase() === name.toLowerCase());
     if (!tag) {
         tag = {
-            id: uuidv4(), name: ASSET_LINKS_TAG, folder_type: TAG_FOLDER_DEFAULT_TYPE, filter_state: 'UNDEFINED',
+            id: uuidv4(), name, folder_type: TAG_FOLDER_DEFAULT_TYPE, filter_state: 'UNDEFINED',
             sort_order: Math.max(0, ...tags.map(t => t.sort_order ?? 0)) + 1, is_hidden_on_character_card: false,
             color: '', color2: '', create_date: Date.now(),
         };
         tags.push(tag);
     }
-    addTagsToEntity(tag, character.avatar);
-    return found.length;
+    addTagsToEntity(tag, avatar);
 }
 
 async function renderAssetLinks() {
@@ -1210,6 +1224,12 @@ async function addSettingsPanel() {
         .prop('checked', getSettings().checkAddedPacks)
         .on('change', function () {
             getSettings().checkAddedPacks = !!$(this).prop('checked');
+            saveSettingsDebounced();
+        });
+    $('#dupe_link_skip_expr_tag')
+        .val(getSettings().expressionsTag)
+        .on('input', function () {
+            getSettings().expressionsTag = String($(this).val()).trim();
             saveSettingsDebounced();
         });
     $('#dupe_link_skip_relink').on('click', () => onRelinkClick());
