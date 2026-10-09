@@ -1426,6 +1426,51 @@ async function onAssetsClick() {
     }
 }
 
+/**
+ * Chub paths ("creator/slug", lowercase) of every Chub character in the library.
+ * @returns {Promise<string[]>}
+ */
+async function getOwnedChubPaths() {
+    const settings = getSettings();
+    const avatars = new Set(characters.map(c => c.avatar));
+    const paths = new Set();
+    const add = (key) => {
+        if (key?.startsWith('chub:')) paths.add(key.slice('chub:'.length));
+    };
+    const { index } = await loadIndex();
+    for (const [avatar, { key }] of Object.entries(index)) {
+        if (avatars.has(avatar)) add(key);
+    }
+    for (const character of characters) {
+        if (!character.shallow) add(keyFromCharacter(character));
+    }
+    for (const [key, avatar] of Object.entries(settings.imported)) {
+        if (avatars.has(avatar)) add(key);
+    }
+    return [...paths];
+}
+
+let appReady = false;
+
+/**
+ * Hands the owned Chub list to the companion userscript
+ * (userscript/DupeLinkSkip-chub.user.js), which hides those cards on Chub.
+ * The detail is a string so it survives the userscript sandbox.
+ */
+async function publishOwned() {
+    if (!appReady) return;
+    const paths = await getOwnedChubPaths();
+    window.dispatchEvent(new CustomEvent('dupelinkskip:owned', {
+        detail: JSON.stringify({ paths, updated: Date.now() }),
+    }));
+}
+
+const publishOwnedDebounced = debounce(() => publishOwned(), 2000);
+
+// The userscript asks when it loads, in case it missed the last publish
+window.addEventListener('dupelinkskip:request', () => publishOwned());
+window['DupeLinkSkip'] = { getOwnedChubPaths };
+
 async function updateStatus() {
     const { index, updated } = await loadIndex();
     const avatars = new Set(characters.map(c => c.avatar));
@@ -1453,6 +1498,7 @@ async function onRefreshClick(full) {
         refreshPromise = null;
         buttons.removeClass('disabled').prop('disabled', false);
         await updateStatus();
+        publishOwnedDebounced();
     }
 }
 
@@ -1692,6 +1738,8 @@ async function onImportClick() {
         }
     }
 
+    publishOwnedDebounced();
+
     const parts = [];
     if (skippedLinks.length) parts.push(`${skippedLinks.length} duplicate link${skippedLinks.length === 1 ? '' : 's'}`);
     if (skippedContent.length) parts.push(`${skippedContent.length} identical card${skippedContent.length === 1 ? '' : 's'}`);
@@ -1709,6 +1757,8 @@ eventSource.on(event_types.APP_READY, async () => {
     await addSettingsPanel();
     await refreshOutfitPicker();
     if (!getSettings().packsMigrated) onRelinkClick();
+    appReady = true;
+    await publishOwned();
 });
 
 eventSource.on(event_types.CHAT_CHANGED, () => refreshOutfitPicker());
@@ -1731,6 +1781,7 @@ eventSource.on(event_types.CHARACTER_RENAMED, async (oldAvatar, newAvatar) => {
 });
 
 eventSource.on(event_types.CHARACTER_DELETED, async ({ character }) => {
+    publishOwnedDebounced();
     const avatar = character?.avatar;
     if (!avatar) return;
     const packs = await loadPacks();
