@@ -2,8 +2,8 @@ import { characters, eventSource, event_types, getRequestHeaders, processDropped
 import { extension_settings, renderExtensionTemplateAsync } from '/scripts/extensions.js';
 import { Popup, POPUP_TYPE } from '/scripts/popup.js';
 import { renderTemplateAsync } from '/scripts/templates.js';
-import { getBase64Async, getStringHash, importFromExternalUrl, isValidUrl, uuidv4 } from '/scripts/utils.js';
-import { addTagsToEntity, tags, TAG_FOLDER_DEFAULT_TYPE } from '/scripts/tags.js';
+import { debounce, getBase64Async, getStringHash, importFromExternalUrl, isValidUrl, uuidv4 } from '/scripts/utils.js';
+import { addTagsToEntity, removeTagFromEntity, tags, TAG_FOLDER_DEFAULT_TYPE } from '/scripts/tags.js';
 import { selected_group } from '/scripts/group-chats.js';
 import { importWorldInfo } from '/scripts/world-info.js';
 
@@ -41,6 +41,13 @@ function getSettings() {
     settings.packsMigrated ??= false;
     // Tag for characters with a downloaded expression pack ('' = none)
     settings.expressionsTag ??= 'EXP Downloaded';
+    // Asset links to ignore: site names (matching subdomains too) or URL fragments containing '/'
+    settings.linkBlacklist ??= [
+        'ko-fi.com', 'patreon.com', 'buymeacoffee.com', 'subscribestar.com', 'subscribestar.adult', 'linktr.ee',
+        'discord.gg', 'discord.com', 'twitter.com', 'x.com', 'instagram.com', 'tiktok.com', 'youtube.com', 'youtu.be',
+    ];
+    // Exact asset link URLs the user dismissed
+    settings.dismissedLinks ??= [];
     // Save Chub gallery and images embedded in card text locally
     settings.localizeAssets ??= true;
     // Which parts the backfill job runs
@@ -848,6 +855,7 @@ async function flagAssetLinks(character) {
         // Images shown in the notes aren't extra assets
         if (/\.(png|jpe?g|webp|gif)(\?|$)/i.test(url) || url.includes('/user/images/')) continue;
         const context = notes.slice(Math.max(0, m.index - 80), m.index + m[0].length + 80).replace(/\s+/g, ' ');
+        if (isLinkIgnored(url)) continue;
         if (ASSET_HOSTS.test(url) || ASSET_WORDS.test(context)) {
             if (!found.some(f => f.url === url)) found.push({ url, context: context.trim() });
         }
@@ -882,19 +890,96 @@ function tagCharacter(avatar, name) {
     addTagsToEntity(tag, avatar);
 }
 
+/**
+ * Whether an asset link is dismissed or matches the blacklist.
+ * @param {string} url
+ */
+function isLinkIgnored(url) {
+    const settings = getSettings();
+    if (settings.dismissedLinks.includes(url)) return true;
+    let host = '';
+    try {
+        host = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+    } catch {
+        return false;
+    }
+    return settings.linkBlacklist.some(pattern => {
+        pattern = pattern.trim().toLowerCase();
+        if (!pattern) return false;
+        if (pattern.includes('/')) return url.toLowerCase().includes(pattern);
+        return host === pattern || host.endsWith(`.${pattern}`);
+    });
+}
+
+/**
+ * Drops stored asset links that are now dismissed or blacklisted, and removes
+ * the tag from characters left without any.
+ */
+async function pruneAssetLinks() {
+    const links = (await sourceCache.getItem('assetLinks')) ?? {};
+    const tag = tags.find(t => t.name === ASSET_LINKS_TAG);
+    for (const [avatar, found] of Object.entries(links)) {
+        const kept = found.filter(({ url }) => !isLinkIgnored(url));
+        if (kept.length === found.length) continue;
+        if (kept.length) {
+            links[avatar] = kept;
+        } else {
+            delete links[avatar];
+            if (tag) removeTagFromEntity(tag, avatar);
+        }
+    }
+    await sourceCache.setItem('assetLinks', links);
+    await renderAssetLinks();
+}
+
+const pruneAssetLinksDebounced = debounce(() => pruneAssetLinks(), 1000);
+
+function dismissLinks(urls) {
+    const dismissed = getSettings().dismissedLinks;
+    for (const url of urls) {
+        if (!dismissed.includes(url)) dismissed.push(url);
+    }
+    saveSettingsDebounced();
+    return pruneAssetLinks();
+}
+
+function blockSite(url) {
+    let host;
+    try {
+        host = new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+    } catch {
+        return;
+    }
+    const blacklist = getSettings().linkBlacklist;
+    if (!blacklist.includes(host)) blacklist.push(host);
+    $('#dupe_link_skip_blacklist').val(blacklist.join('\n'));
+    saveSettingsDebounced();
+    return pruneAssetLinks();
+}
+
 async function renderAssetLinks() {
     const list = $('#dupe_link_skip_links_list').empty();
     const links = (await sourceCache.getItem('assetLinks')) ?? {};
     const byAvatar = new Map(characters.map(c => [c.avatar, c]));
     const entries = Object.entries(links).filter(([avatar]) => byAvatar.has(avatar));
     $('#dupe_link_skip_links_count').text(entries.length);
+    const button = (icon, title, onClick) => $(`<i class="menu_button menu_button_icon fa-solid ${icon}"></i>`)
+        .attr('title', title).on('click', onClick);
+
     for (const [avatar, found] of entries) {
         const item = $('<div class="marginBot5"></div>');
-        item.append($('<b></b>').text(`${byAvatar.get(avatar).name} (${avatarFolder(avatar)})`));
+        const header = $('<div class="flex-container alignItemsCenter"></div>');
+        header.append($('<b class="flex1"></b>').text(`${byAvatar.get(avatar).name} (${avatarFolder(avatar)})`));
+        header.append(button('fa-xmark', 'Dismiss all links for this character', () => dismissLinks(found.map(f => f.url))));
+        item.append(header);
         for (const { url, context } of found) {
-            const row = $('<div></div>');
-            row.append($('<a target="_blank" rel="noopener noreferrer"></a>').attr('href', url).text(url));
-            row.append($('<small class="flex-container"></small>').text(context));
+            const row = $('<div class="flex-container alignItemsCenter flexnowrap"></div>');
+            const text = $('<div class="flex1" style="min-width: 0; overflow-wrap: anywhere;"></div>');
+            text.append($('<a target="_blank" rel="noopener noreferrer"></a>').attr('href', url).text(url));
+            text.append($('<small class="flex-container"></small>').text(context));
+            row.append(text);
+            row.append(button('fa-xmark', 'Dismiss this link (everywhere it appears)', () => dismissLinks([url])));
+            row.append(button('fa-ban', 'Block this site', () => blockSite(url)));
             item.append(row);
         }
         list.append(item);
@@ -1249,12 +1334,19 @@ async function addSettingsPanel() {
     }
     $('#dupe_link_skip_expr_fetch').on('click', () => onAssetsClick());
     $('#dupe_link_skip_links_drawer .inline-drawer-toggle').on('click', () => renderAssetLinks());
+    $('#dupe_link_skip_blacklist')
+        .val(getSettings().linkBlacklist.join('\n'))
+        .on('input', function () {
+            getSettings().linkBlacklist = String($(this).val()).split('\n').map(x => x.trim()).filter(Boolean);
+            saveSettingsDebounced();
+            pruneAssetLinksDebounced();
+        });
     $('#dupe_link_skip_load_new').on('click', () => onRefreshClick(false));
     $('#dupe_link_skip_rebuild').on('click', () => onRefreshClick(true));
     // Keep status current when the drawer is opened
     $('#dupe_link_skip_settings .inline-drawer-toggle').on('click', () => updateStatus());
     await updateStatus();
-    await renderAssetLinks();
+    await pruneAssetLinks();
 }
 
 /**

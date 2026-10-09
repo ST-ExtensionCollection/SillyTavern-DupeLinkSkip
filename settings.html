@@ -74,7 +74,9 @@
                 </div>
                 <div class="inline-drawer-content">
                     <small>Links in creator notes that look like extra sprite packs, archives or file hosts. These characters also get the "Asset links" tag.</small>
-                    <div id="dupe_link_skip_links_list"></div>
+                    <label for="dupe_link_skip_blacklist"><small>Ignore links to (one per line: a site like <tt>ko-fi.com</tt>, which covers its subdomains, or part of a URL containing <tt>/</tt>)</small></label>
+                    <textarea id="dupe_link_skip_blacklist" class="text_pole textarea_compact" rows="4"></textarea>
+                    <div id="dupe_link_skip_links_list" class="marginTop5"></div>
                 </div>
             </div>
         </div>
