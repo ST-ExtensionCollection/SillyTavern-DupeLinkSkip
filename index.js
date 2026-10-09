@@ -1,8 +1,9 @@
-import { characters, eventSource, event_types, getRequestHeaders, processDroppedFiles, saveSettingsDebounced } from '/script.js';
+import { characters, eventSource, event_types, getRequestHeaders, processDroppedFiles, saveSettingsDebounced, this_chid } from '/script.js';
 import { extension_settings, renderExtensionTemplateAsync } from '/scripts/extensions.js';
 import { Popup, POPUP_TYPE } from '/scripts/popup.js';
 import { renderTemplateAsync } from '/scripts/templates.js';
 import { getStringHash, importFromExternalUrl, isValidUrl } from '/scripts/utils.js';
+import { selected_group } from '/scripts/group-chats.js';
 import { importWorldInfo } from '/scripts/world-info.js';
 
 const MODULE = 'dupeLinkSkip';
@@ -33,6 +34,8 @@ function getSettings() {
     settings.downloadExpressions ??= true;
     // Backfill also asks Chub about cards stored without a pack, in case one was added since
     settings.checkAddedPacks ??= false;
+    // Set once packs downloaded before sprite associations existed have been linked
+    settings.packsMigrated ??= false;
     // Map of normalized source key -> avatar file name, for imports whose
     // source ST doesn't store on the card (JanitorAI, generic PNG links, etc).
     settings.imported ??= {};
@@ -323,6 +326,176 @@ async function uploadSpriteZip(folder, blob) {
     return (await response.json()).count ?? 0;
 }
 
+const avatarFolder = (avatar) => avatar.replace(/\.[^/.]+$/, '');
+
+/**
+ * Sprite folder for a Chub pack. The default pack goes in the character's own
+ * folder (named after its avatar file, so same-named cards don't collide), or
+ * a "chub" subfolder if that already has sprites; alt packs get a subfolder
+ * named after their version.
+ * @param {string} root avatarFolder() of the character
+ * @param {string|null} sub Alt pack version, null for the default pack
+ * @param {boolean} rootHasSprites
+ */
+function packFolder(root, sub, rootHasSprites) {
+    const name = (sub ?? (rootHasSprites ? 'chub' : '')).replace(/[\\/]/g, '_');
+    return name ? `${root}/${name}` : root;
+}
+
+/**
+ * Sprite folders this extension created, per character. ST has no way to list
+ * sprite subfolders, so this is what the outfit picker offers.
+ * @returns {Promise<Record<string, {folders: string[]}>>} avatar -> entry
+ */
+async function loadPacks() {
+    return (await sourceCache.getItem('packs')) ?? {};
+}
+
+// Serializes read-modify-write of the pack list (re-linking runs in parallel)
+let packsWrite = Promise.resolve();
+
+function recordPackFolders(avatar, folders) {
+    if (!folders.length) return packsWrite;
+    packsWrite = packsWrite.then(async () => {
+        const packs = await loadPacks();
+        const entry = packs[avatar] ??= { folders: [] };
+        for (const folder of folders) {
+            if (!entry.folders.includes(folder)) entry.folders.push(folder);
+        }
+        await sourceCache.setItem('packs', packs);
+    }).catch(error => console.error('[Dupe Link Skip] Could not save pack list', error));
+    return packsWrite.then(() => refreshOutfitPicker());
+}
+
+function getExpressionOverrides() {
+    return extension_settings.expressionOverrides ??= [];
+}
+
+/**
+ * Points ST's expressions at a downloaded pack, through the native sprite
+ * folder override (keyed by avatar file name). Leaves characters alone that
+ * already have an override, or sprites in the folder named after them, which
+ * is where ST looks by default.
+ * @param {any} character
+ * @param {string} folder
+ * @returns {Promise<boolean>} Whether the override was set
+ */
+async function associateSprites(character, folder) {
+    const name = avatarFolder(character.avatar);
+    if (getExpressionOverrides().some(o => o.name === name && o.path)) return false;
+    if (character.name !== folder && (await getSprites(character.name)).length) return false;
+    getExpressionOverrides().push({ name, path: folder });
+    saveSettingsDebounced();
+    await refreshOutfitPicker();
+    return true;
+}
+
+/**
+ * Records and links packs downloaded before associations existed. Checks the
+ * folders a download would have used for every character already checked.
+ * @param {(done: number, total: number) => void} onProgress
+ * @returns {Promise<number>} Characters with packs found
+ */
+async function relinkPacks(onProgress) {
+    const checked = await loadExpressionsChecked();
+    const byAvatar = new Map(characters.map(c => [c.avatar, c]));
+    const queue = Object.keys(checked).filter(a => byAvatar.has(a));
+    const total = queue.length;
+    let done = 0, found = 0;
+    onProgress(done, total);
+
+    const worker = async () => {
+        while (queue.length) {
+            const avatar = queue.pop();
+            try {
+                const character = byAvatar.get(avatar);
+                const full = character.shallow ? await fetchFullCharacter(avatar) : character;
+                const packs = chubPacks(full.data?.extensions?.chub);
+                if (packs.length) {
+                    const root = avatarFolder(avatar);
+                    const candidates = new Set([root, ...packs.map(({ sub }) => packFolder(root, sub, true))]);
+                    const folders = [];
+                    for (const folder of candidates) {
+                        if ((await getSprites(folder)).length) folders.push(folder);
+                    }
+                    if (folders.length) {
+                        found++;
+                        await recordPackFolders(avatar, folders);
+                        await associateSprites(full, folders[0]);
+                    }
+                }
+            } catch (error) {
+                console.warn('[Dupe Link Skip] Could not re-link sprites for', avatar, error);
+            }
+            onProgress(++done, total);
+        }
+    };
+    await Promise.all(Array.from({ length: FETCH_CONCURRENCY }, worker));
+    return found;
+}
+
+async function onRelinkClick() {
+    const button = $('#dupe_link_skip_relink');
+    if (button.prop('disabled')) return;
+    button.addClass('disabled').prop('disabled', true);
+    const status = $('#dupe_link_skip_expr_status');
+    try {
+        const found = await relinkPacks((done, total) => status.text(`Re-linking sprite packs... ${done} / ${total}`));
+        getSettings().packsMigrated = true;
+        saveSettingsDebounced();
+        status.text(`Re-linked sprite packs for ${found} characters.`);
+    } catch (error) {
+        console.error('[Dupe Link Skip] Re-link failed', error);
+        status.text(`Re-link failed: ${error}`);
+    } finally {
+        button.removeClass('disabled').prop('disabled', false);
+    }
+}
+
+/**
+ * Adds an outfit dropdown under ST's Sprite Folder Override field, listing the
+ * current character's default folder and the packs downloaded for it.
+ * Picking one goes through the native override (same as /costume).
+ */
+async function refreshOutfitPicker() {
+    const input = $('#expression_override');
+    if (!input.length) return;
+
+    let container = $('#dupe_link_skip_outfit');
+    if (!container.length) {
+        container = $(`<div id="dupe_link_skip_outfit" class="flex-container flexnowrap alignItemsCenter marginTop5">
+            <label for="dupe_link_skip_outfit_select">Outfit</label>
+            <select id="dupe_link_skip_outfit_select" class="text_pole flex1"></select>
+        </div>`);
+        input.closest('.flex-container').after(container);
+        container.find('select').on('change', function () {
+            input.val(String($(this).val()));
+            $('#expression_override_button').trigger('click');
+        });
+        // Keep the dropdown in sync when the override is typed in by hand
+        $(document).on('click', '#expression_override_button', () => setTimeout(refreshOutfitPicker));
+    }
+
+    const character = characters[this_chid];
+    if (selected_group || !character) {
+        container.hide();
+        return;
+    }
+
+    const name = avatarFolder(character.avatar);
+    const current = getExpressionOverrides().find(o => o.name === name)?.path ?? '';
+    const folders = (await loadPacks())[character.avatar]?.folders ?? [];
+    const options = [['', `Default (${character.name})`], ...folders.map(f => [f, f])];
+    if (current && !folders.includes(current)) options.push([current, current]);
+
+    const select = container.find('select').empty();
+    for (const [value, label] of options) {
+        select.append($('<option></option>').val(value).text(label));
+    }
+    select.val(current);
+    container.toggle(options.length > 1);
+}
+
 /**
  * Downloads a character's Chub expression packs (stored on the card under
  * extensions.chub) into its sprite folder. The default pack goes in the main
@@ -330,16 +503,18 @@ async function uploadSpriteZip(folder, blob) {
  * packs go in subfolders named after their version. Images already present
  * (same bytes) and Chub's stock placeholders are skipped, and nothing is
  * overwritten.
- * @param {string} avatar Character avatar file name
+ * Folders written to are recorded and linked to the character.
+ * @param {any} character Full (non-shallow) character
  * @param {any} chub The card's extensions.chub
  * @param {{gap?: number}} [options] gap: delay in ms between image downloads
  * @returns {Promise<number>} Number of sprites written
  */
-async function importChubExpressions(avatar, chub, { gap = 0 } = {}) {
+async function importChubExpressions(character, chub, { gap = 0 } = {}) {
     const packs = chubPacks(chub);
     if (!packs.length) return 0;
 
-    const root = avatar.replace(/\.[^/.]+$/, '');
+    const root = avatarFolder(character.avatar);
+    const writtenFolders = [];
     const knownHashes = new Set();
     const hashSprites = async (sprites) => {
         for (const sprite of sprites) {
@@ -356,15 +531,16 @@ async function importChubExpressions(avatar, chub, { gap = 0 } = {}) {
     let written = 0;
 
     for (const { pack, sub } of packs) {
-        const folderName = (sub ?? (rootSprites.length ? 'chub' : '')).replace(/[\\/]/g, '_');
-        const folder = folderName ? `${root}/${folderName}` : root;
+        const folder = packFolder(root, sub, rootSprites.length > 0);
         const entries = Object.entries(pack.expressions ?? {})
             .filter(([, url]) => typeof url === 'string' && url && !CHUB_STOCK_EXPRESSIONS.test(url));
 
         if (!entries.length) {
             // Labels unlisted; fall back to the pack's zip if it has one
             if (pack.compressed && !Object.keys(pack.expressions ?? {}).length && !(await getSprites(folder)).length) {
-                written += await uploadSpriteZip(folder, await fetchBlob(pack.compressed));
+                const count = await uploadSpriteZip(folder, await fetchBlob(pack.compressed));
+                if (count) writtenFolders.push(folder);
+                written += count;
             }
             continue;
         }
@@ -385,9 +561,13 @@ async function importChubExpressions(avatar, chub, { gap = 0 } = {}) {
             ownHashes.add(hash);
             knownHashes.add(hash);
             taken.add(label.toLowerCase());
+            if (!writtenFolders.includes(folder)) writtenFolders.push(folder);
             written++;
         }
     }
+
+    await recordPackFolders(character.avatar, writtenFolders);
+    if (writtenFolders.length) await associateSprites(character, writtenFolders[0]);
 
     if (written) {
         toastr.success(`${written} sprite${written === 1 ? '' : 's'}`, `Imported Expression Pack for ${root}`);
@@ -556,7 +736,7 @@ async function backfillExpressions(job, onStatus) {
                 await sleep(1000);
             }
 
-            const count = await importChubExpressions(character.avatar, chub, { gap: 250 });
+            const count = await importChubExpressions(full, chub, { gap: 250 });
             checked[character.avatar] = { t: Date.now(), remote: true };
             written += count;
             if (count) {
@@ -667,6 +847,7 @@ async function addSettingsPanel() {
             getSettings().checkAddedPacks = !!$(this).prop('checked');
             saveSettingsDebounced();
         });
+    $('#dupe_link_skip_relink').on('click', () => onRelinkClick());
     $('#dupe_link_skip_expr_fetch').on('click', () => onExpressionsClick());
     $('#dupe_link_skip_load_new').on('click', () => onRefreshClick(false));
     $('#dupe_link_skip_rebuild').on('click', () => onRefreshClick(true));
@@ -776,7 +957,7 @@ async function onImportClick() {
             if (downloadExpressions && key.startsWith('chub:')) {
                 try {
                     const full = added.shallow ? await fetchFullCharacter(added.avatar) : added;
-                    await importChubExpressions(added.avatar, full.data?.extensions?.chub);
+                    await importChubExpressions(full, full.data?.extensions?.chub);
                     await markExpressionsChecked(added.avatar);
                 } catch (error) {
                     console.error('[Dupe Link Skip] Could not download expressions for', added.avatar, error);
@@ -801,4 +982,42 @@ eventSource.on(event_types.APP_READY, async () => {
     $(document).off('click', IMPORT_SELECTOR);
     $(document).on('click', IMPORT_SELECTOR, onImportClick);
     await addSettingsPanel();
+    await refreshOutfitPicker();
+    if (!getSettings().packsMigrated) onRelinkClick();
+});
+
+eventSource.on(event_types.CHAT_CHANGED, () => refreshOutfitPicker());
+
+// ST's expressions extension doesn't follow renames or deletions, so keep the
+// overrides and pack list pointed at the right avatar
+eventSource.on(event_types.CHARACTER_RENAMED, async (oldAvatar, newAvatar) => {
+    const override = getExpressionOverrides().find(o => o.name === avatarFolder(oldAvatar));
+    if (override) {
+        override.name = avatarFolder(newAvatar);
+        saveSettingsDebounced();
+    }
+    for (const key of ['packs', 'expressionsChecked']) {
+        const map = (await sourceCache.getItem(key)) ?? {};
+        if (map[oldAvatar] === undefined) continue;
+        map[newAvatar] = map[oldAvatar];
+        delete map[oldAvatar];
+        await sourceCache.setItem(key, map);
+    }
+});
+
+eventSource.on(event_types.CHARACTER_DELETED, async ({ character }) => {
+    const avatar = character?.avatar;
+    if (!avatar) return;
+    const packs = await loadPacks();
+    const folders = packs[avatar]?.folders ?? [];
+    const overrides = getExpressionOverrides();
+    const index = overrides.findIndex(o => o.name === avatarFolder(avatar) && folders.includes(o.path));
+    if (index !== -1) {
+        overrides.splice(index, 1);
+        saveSettingsDebounced();
+    }
+    if (packs[avatar]) {
+        delete packs[avatar];
+        await sourceCache.setItem('packs', packs);
+    }
 });

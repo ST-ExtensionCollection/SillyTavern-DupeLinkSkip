@@ -33,6 +33,7 @@
             </label>
             <small>
                 Packs go into the character's sprite folder, or a "chub" subfolder if it already has sprites. Alternate packs go into subfolders named after their version. Images already present are skipped.
+                A downloaded pack becomes the character's Sprite Folder Override unless it already uses other sprites; switch between packs with the Outfit dropdown in the Expressions settings.
             </small>
             <label class="checkbox_label" for="dupe_link_skip_expr_added" title="Fetch Chub expressions normally only handles cards that were saved with a pack. With this on, it also asks Chub about every other Chub card, in case a pack was added after you imported it. One request per card, so it's slow on large libraries.">
                 <input type="checkbox" id="dupe_link_skip_expr_added">
@@ -41,6 +42,9 @@
             <div class="flex-container marginTop5">
                 <div id="dupe_link_skip_expr_fetch" class="menu_button" title="Download expression packs for Chub characters already in your library. Runs slowly in the background; characters already checked are skipped.">
                     <i class="fa-solid fa-face-smile"></i> Fetch Chub expressions
+                </div>
+                <div id="dupe_link_skip_relink" class="menu_button" title="Find downloaded packs and point each character's Sprite Folder Override at them. Characters that already use other sprites are left alone. Runs automatically once.">
+                    <i class="fa-solid fa-link"></i> Re-link sprite packs
                 </div>
             </div>
             <small id="dupe_link_skip_expr_status"></small>
