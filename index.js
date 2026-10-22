@@ -1500,7 +1500,8 @@ async function backfillAssets(job, onStatus) {
         }
         if (usedChub) await sleep(1000);
         result.done++;
-        if (result.done % 25 === 0) await save();
+        // Every character, so a reload redoes at most the one it was on
+        await save();
     }
 
     await save();
@@ -2568,15 +2569,78 @@ async function importAssets(character, { isChub, downloadExpressions, localizeAs
  * @property {{preventDuplicates: boolean, contentCheck: boolean, downloadExpressions: boolean, localizeAssets: boolean}} opts
  * @property {'pending'|'running'|'done'|'warn'|'skipped'|'failed'} state
  * @property {string} note
+ * @property {boolean} [interrupted] Started but not finished; still set after a reload means the page was reloaded mid-import
  */
 
 /**
  * Imports run one link at a time, in the order they were added; Import clicks
  * while a run is going add to it, so duplicate checks see earlier links and
  * each new character is matched to the link that brought it in.
- * @type {{items: QueueItem[], running: boolean, stop: boolean, hidden: boolean, collapsed: boolean}}
+ * The list is saved as it changes, so links not finished when the page is
+ * reloaded are offered again (paused until Resume).
+ * @type {{items: QueueItem[], running: boolean, stop: boolean, hidden: boolean, collapsed: boolean, paused: boolean}}
  */
-const importQueue = { items: [], running: false, stop: false, hidden: false, collapsed: false };
+const importQueue = { items: [], running: false, stop: false, hidden: false, collapsed: false, paused: false };
+
+let importQueueWrite = Promise.resolve();
+
+/** Saves the queue's links and their states, for picking up after a reload. */
+function saveImportQueue() {
+    const items = importQueue.items.map(({ url, opts, state, note, interrupted }) => ({ url, opts, state, note, interrupted }));
+    importQueueWrite = importQueueWrite
+        .then(() => sourceCache.setItem('importQueue', items))
+        .catch(error => console.error('[Dupe Link Skip] Could not save import queue', error));
+    return importQueueWrite;
+}
+
+/** After a reload: shows links the last session didn't finish, paused until Resume or Dismiss. */
+async function restoreImportQueue() {
+    /** @type {QueueItem[]} */
+    const items = (await sourceCache.getItem('importQueue')) ?? [];
+    if (!items.some(i => i.state === 'pending' || i.state === 'running')) {
+        if (items.length) await sourceCache.removeItem('importQueue');
+        return;
+    }
+    for (const item of items) {
+        if (item.state === 'running') {
+            item.state = 'pending';
+            item.note = 'Interrupted by reload';
+            item.interrupted = true;
+        }
+    }
+    importQueue.items = items;
+    importQueue.paused = true;
+    importQueue.hidden = false;
+    renderImportPanel();
+}
+
+function resumeImportQueue() {
+    if (importQueue.running) return;
+    runImportQueue();
+}
+
+function dismissImportQueue() {
+    for (const item of importQueue.items.filter(i => i.state === 'pending')) {
+        item.state = 'skipped';
+        item.note = 'Dismissed';
+        delete item.interrupted;
+    }
+    importQueue.paused = false;
+    renderImportPanel();
+    saveImportQueue();
+}
+
+/**
+ * Character imported from a link: recorded on import, or found by the scan.
+ * @returns {Promise<string|null>} Avatar
+ */
+async function findImportedAvatar(key) {
+    const avatars = new Set(characters.map(c => c.avatar));
+    const recorded = getSettings().imported[key];
+    if (recorded && avatars.has(recorded)) return recorded;
+    const { index } = await loadIndex();
+    return Object.entries(index).find(([avatar, entry]) => entry.key === key && avatars.has(avatar))?.[0] ?? null;
+}
 
 const QUEUE_ICONS = {
     pending: 'fa-regular fa-clock',
@@ -2600,6 +2664,8 @@ function renderImportPanel() {
             <div class="dls_queue_list"></div>
             <div class="dls_queue_footer">
                 <div class="dls_queue_stop menu_button" title="Finish the current link, then skip the rest">Stop after this link</div>
+                <div class="dls_queue_resume menu_button" title="Import the links that weren't finished">Resume</div>
+                <div class="dls_queue_dismiss menu_button" title="Forget the links that weren't finished">Dismiss</div>
             </div>
         </div>`).appendTo('body');
         panel.find('.dls_queue_collapse').on('click', () => {
@@ -2614,6 +2680,8 @@ function renderImportPanel() {
             importQueue.stop = true;
             renderImportPanel();
         });
+        panel.find('.dls_queue_resume').on('click', () => resumeImportQueue());
+        panel.find('.dls_queue_dismiss').on('click', () => dismissImportQueue());
     }
 
     const { items } = importQueue;
@@ -2626,15 +2694,20 @@ function renderImportPanel() {
 
     const finished = items.filter(i => i.state !== 'pending' && i.state !== 'running').length;
     const current = items.find(i => i.state === 'running');
-    let title = `Import queue (${finished}/${items.length})`;
+    const waiting = items.filter(i => i.state === 'pending').length;
+    let title = importQueue.paused
+        ? `Interrupted import (${waiting} link${waiting === 1 ? '' : 's'} not finished)`
+        : `Import queue (${finished}/${items.length})`;
     // Collapsed, the header is all that shows, so it carries the current step
     if (importQueue.collapsed && current?.note) title += ` · ${current.note}`;
     panel.find('.dls_queue_title').text(title);
 
-    panel.find('.dls_queue_footer').toggle(importQueue.running);
+    panel.find('.dls_queue_footer').toggle(importQueue.running || importQueue.paused);
     panel.find('.dls_queue_stop')
+        .toggle(importQueue.running)
         .text(importQueue.stop ? 'Stopping…' : 'Stop after this link')
         .toggleClass('disabled', importQueue.stop);
+    panel.find('.dls_queue_resume, .dls_queue_dismiss').toggle(importQueue.paused && !importQueue.running);
 
     const list = panel.find('.dls_queue_list').empty();
     for (const item of items) {
@@ -2674,6 +2747,23 @@ async function importQueueItem(item, getExistingOnce) {
     const isLorebook = key.startsWith('chublore:');
     // Kept up to date even when this link doesn't check, for later links that do
     const existing = await getExistingOnce(opts.preventDuplicates);
+
+    // Cut off by a reload: ST may have saved the character before its assets were done
+    if (item.interrupted && key && !isLorebook) {
+        const avatar = await findImportedAvatar(key);
+        const character = avatar && characters.find(c => c.avatar === avatar);
+        if (character) {
+            existing?.keys.add(key);
+            const failed = await importAssets(character, {
+                isChub: key.startsWith('chub:'),
+                downloadExpressions: opts.downloadExpressions,
+                localizeAssets: opts.localizeAssets,
+            }, setStep);
+            if (failed.length) finish('warn', `Imported ${character.name} before the reload; could not ${failed.join(', ')}`);
+            else finish('done', `Imported ${character.name} before the reload; assets finished`);
+            return null;
+        }
+    }
 
     if (existing && key && !isLorebook && existing.keys.has(key)) {
         finish('skipped', 'Duplicate link');
@@ -2752,6 +2842,13 @@ async function importQueueItem(item, getExistingOnce) {
 async function runImportQueue() {
     importQueue.running = true;
     importQueue.stop = false;
+    importQueue.paused = false;
+    renderImportPanel();
+    // A character the server saved after a reload isn't scanned yet; this only reads new ones
+    if (importQueue.items.some(i => i.state === 'pending' && i.interrupted)) {
+        if (refreshPromise) await refreshPromise;
+        else await onRefreshClick(false);
+    }
     /** @type {Promise<{keys: Set<string>, hashes: Set<string>}>|null} */
     let existing = null;
     const getExistingOnce = (load) => load ? (existing ??= getExisting()) : existing;
@@ -2763,7 +2860,9 @@ async function runImportQueue() {
         while (!importQueue.stop && (item = importQueue.items.find(i => i.state === 'pending'))) {
             item.state = 'running';
             item.note = '';
+            item.interrupted = true;
             renderImportPanel();
+            await saveImportQueue();
             try {
                 const skipped = await importQueueItem(item, getExistingOnce);
                 if (skipped === 'link') skippedLinks.push(item.url);
@@ -2773,16 +2872,20 @@ async function runImportQueue() {
                 item.state = 'failed';
                 item.note = String(error?.message ?? error);
             }
+            delete item.interrupted;
             renderImportPanel();
+            await saveImportQueue();
         }
         for (const rest of importQueue.items.filter(i => i.state === 'pending')) {
             rest.state = 'skipped';
             rest.note = 'Stopped';
+            delete rest.interrupted;
         }
     } finally {
         importQueue.running = false;
         importQueue.stop = false;
         renderImportPanel();
+        await saveImportQueue();
     }
 
     publishOwnedDebounced();
@@ -2861,8 +2964,8 @@ async function onImportClick() {
     const inputs = String(input).split('\n').map(x => x.trim()).filter(x => x.length > 0);
     const opts = { preventDuplicates, contentCheck: preventDuplicates && settings.contentCheck, downloadExpressions, localizeAssets };
 
-    // A new run starts with a fresh list
-    if (!importQueue.running) importQueue.items = [];
+    // A new run starts with a fresh list, unless links from before a reload are still waiting
+    if (!importQueue.running && !importQueue.items.some(i => i.state === 'pending')) importQueue.items = [];
     const queued = new Set(importQueue.items.filter(i => i.state === 'pending' || i.state === 'running').map(i => i.url));
     let added = 0, repeated = 0;
     for (const url of inputs) {
@@ -2876,6 +2979,7 @@ async function onImportClick() {
     }
     importQueue.hidden = false;
     renderImportPanel();
+    await saveImportQueue();
 
     const repeatedText = repeated ? ` ${repeated} already queued.` : '';
     if (importQueue.running) {
@@ -2897,6 +3001,7 @@ eventSource.on(event_types.APP_READY, async () => {
     await addSettingsPanel();
     await refreshOutfitPicker();
     if (!getSettings().packsMigrated) onRelinkClick();
+    await restoreImportQueue();
     appReady = true;
     await publishOwned();
 });
