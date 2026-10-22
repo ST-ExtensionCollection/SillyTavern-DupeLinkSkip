@@ -537,12 +537,18 @@ async function refreshOutfitPicker() {
  * Folders written to are recorded and linked to the character.
  * @param {any} character Full (non-shallow) character
  * @param {any} chub The card's extensions.chub
- * @param {{gap?: number}} [options] gap: delay in ms between image downloads
+ * @param {{gap?: number, onProgress?: (done: number, total: number) => void}} [options]
+ *   gap: delay in ms between image downloads; onProgress: called as images are handled
  * @returns {Promise<number>} Number of sprites written
  */
-async function importChubExpressions(character, chub, { gap = 0 } = {}) {
+async function importChubExpressions(character, chub, { gap = 0, onProgress } = {}) {
     const packs = chubPacks(chub);
     if (!packs.length) return 0;
+    const packEntries = (pack) => Object.entries(pack.expressions ?? {})
+        .filter(([, url]) => typeof url === 'string' && url && !CHUB_STOCK_EXPRESSIONS.test(url));
+    const total = packs.reduce((sum, { pack }) => sum + packEntries(pack).length, 0);
+    let done = 0;
+    onProgress?.(done, total);
 
     const root = avatarFolder(character.avatar);
     const writtenFolders = [];
@@ -570,8 +576,7 @@ async function importChubExpressions(character, chub, { gap = 0 } = {}) {
 
     for (const { pack, sub } of packs) {
         const folder = packFolder(root, sub, rootTaken);
-        const entries = Object.entries(pack.expressions ?? {})
-            .filter(([, url]) => typeof url === 'string' && url && !CHUB_STOCK_EXPRESSIONS.test(url));
+        const entries = packEntries(pack);
 
         if (!entries.length) {
             // Labels unlisted; fall back to the pack's zip if it has one
@@ -591,6 +596,7 @@ async function importChubExpressions(character, chub, { gap = 0 } = {}) {
         const ownHashes = ownFolders.includes(folder) ? new Set(folderHashes) : new Set();
 
         for (const [label, url] of entries) {
+            onProgress?.(done++, total);
             if (taken.has(label.toLowerCase())) continue;
             const blob = await fetchExternal(url);
             if (gap) await sleep(gap);
@@ -747,10 +753,10 @@ async function fetchChubGallery(projectId) {
 /**
  * Downloads a Chub character's gallery into its gallery folder.
  * @param {any} character Full character
- * @param {{gap?: number}} [options]
+ * @param {{gap?: number, onProgress?: (done: number, total: number) => void}} [options]
  * @returns {Promise<number>} Images added
  */
-async function importChubGallery(character, { gap = 0 } = {}) {
+async function importChubGallery(character, { gap = 0, onProgress } = {}) {
     const projectId = character.data?.extensions?.chub?.id;
     if (!projectId) return 0;
     const urls = await fetchChubGallery(projectId);
@@ -767,7 +773,8 @@ async function importChubGallery(character, { gap = 0 } = {}) {
     const existing = new Set(await listGalleryImages(folder));
     let added = 0, recorded = 0;
     try {
-        for (const url of pending) {
+        for (const [i, url] of pending.entries()) {
+            onProgress?.(i, pending.length);
             const saved = await saveGalleryImage(folder, 'chub', await fetchExternal(url), url, existing);
             if (saved) {
                 savedUrls[url] = saved.path;
@@ -804,16 +811,18 @@ async function loadLorebooks() {
  * characters reuse it, as do books already in ST under the name ST's Chub
  * importer gives them (the URL slug).
  * @param {any} character Full character
+ * @param {{onProgress?: (done: number, total: number) => void}} [options]
  * @returns {Promise<number>} Lorebooks downloaded
  */
-async function importChubLorebooks(character) {
+async function importChubLorebooks(character, { onProgress } = {}) {
     const related = character.data?.extensions?.chub?.related_lorebooks;
     if (!Array.isArray(related) || !related.length) return 0;
 
     const known = await loadLorebooks();
     const names = [];
     let added = 0;
-    for (const book of related) {
+    for (const [i, book] of related.entries()) {
+        onProgress?.(i, related.length);
         const path = String(book?.path ?? '').replace(/^\/?lorebooks\//, '');
         if (!path.includes('/')) continue;
         const key = path.toLowerCase();
@@ -885,10 +894,10 @@ const EMBEDDED_IMAGE = /(!\[[^\]]*\]\(\s*<?)(https?:\/\/[^\s)>]+)([^)]*\))|(<img
  * comment macro ({{// original: url }}), which is hidden when shown and
  * left out of prompts. Links that can't be downloaded are left as they are.
  * @param {any} character Full character
- * @param {{gap?: number}} [options]
+ * @param {{gap?: number, onProgress?: (done: number, total: number) => void}} [options]
  * @returns {Promise<{saved: number, failed: number}>}
  */
-async function localizeImages(character, { gap = 0 } = {}) {
+async function localizeImages(character, { gap = 0, onProgress } = {}) {
     const data = character.data ?? {};
     const texts = TEXT_FIELDS.map(f => [f, data[f]]).filter(([, v]) => typeof v === 'string');
     const greetings = Array.isArray(data.alternate_greetings) ? data.alternate_greetings : [];
@@ -908,7 +917,9 @@ async function localizeImages(character, { gap = 0 } = {}) {
     // URLs saved before (kept on the card) reuse that file without downloading
     const savedUrls = data.extensions?.dupe_link_skip?.images ?? {};
     let downloaded = 0;
+    let done = 0;
     for (const url of urls) {
+        onProgress?.(done++, urls.size);
         if (savedUrls[url]) {
             local[url] = savedUrls[url];
             continue;
@@ -1590,51 +1601,296 @@ async function addSettingsPanel() {
 /**
  * Runs the asset steps for a freshly imported character. Each step reports its
  * own failure so one broken part doesn't stop the rest.
+ * @param {(text: string) => void} [onStep] Told what is being done right now
+ * @returns {Promise<string[]>} Labels of the steps that failed
  */
-async function importAssets(character, { isChub, downloadExpressions, localizeAssets }) {
+async function importAssets(character, { isChub, downloadExpressions, localizeAssets }, onStep = () => {}) {
     let full;
     try {
         full = character.shallow ? await fetchFullCharacter(character.avatar) : character;
     } catch (error) {
         console.error('[Dupe Link Skip] Could not read imported character', character.avatar, error);
-        return;
+        return ['read the imported character'];
     }
+    const failed = [];
     const step = async (label, fn) => {
         try {
             await fn();
         } catch (error) {
             console.error(`[Dupe Link Skip] Could not ${label} for`, character.avatar, error);
             toastr.warning(`Could not ${label} for ${character.name}.`, 'Import Characters');
+            failed.push(label);
         }
     };
+    const progress = (name) => (done, total) => onStep(total ? `${name} ${done}/${total}` : name);
 
     await step('check notes for asset links', async () => {
+        onStep('Checking notes for asset links');
         await flagAssetLinks(full);
         await markAssetsChecked(character.avatar, ['links']);
     });
     if (isChub && downloadExpressions) {
         await step('download expressions', async () => {
-            await importChubExpressions(full, full.data?.extensions?.chub);
+            onStep('Expressions');
+            await importChubExpressions(full, full.data?.extensions?.chub, { onProgress: progress('Expressions') });
             await markExpressionsChecked(character.avatar);
         });
     }
     if (isChub && localizeAssets) {
         await step('download the Chub gallery', async () => {
-            await importChubGallery(full);
+            onStep('Gallery');
+            await importChubGallery(full, { onProgress: progress('Gallery') });
             await markAssetsChecked(character.avatar, ['gallery']);
         });
     }
     if (isChub && getSettings().downloadLorebooks) {
         await step('download linked lorebooks', async () => {
-            await importChubLorebooks(full);
+            onStep('Lorebooks');
+            await importChubLorebooks(full, { onProgress: progress('Lorebooks') });
             await markAssetsChecked(character.avatar, ['lorebooks']);
         });
     }
     if (localizeAssets) {
         await step('save card images', async () => {
-            await localizeImages(full);
+            onStep('Card images');
+            await localizeImages(full, { onProgress: progress('Card images') });
             await markAssetsChecked(character.avatar, ['images']);
         });
+    }
+    return failed;
+}
+
+/**
+ * @typedef {object} QueueItem
+ * @property {string} url
+ * @property {{preventDuplicates: boolean, contentCheck: boolean, downloadExpressions: boolean, localizeAssets: boolean}} opts
+ * @property {'pending'|'running'|'done'|'warn'|'skipped'|'failed'} state
+ * @property {string} note
+ */
+
+/**
+ * Imports run one link at a time, in the order they were added; Import clicks
+ * while a run is going add to it, so duplicate checks see earlier links and
+ * each new character is matched to the link that brought it in.
+ * @type {{items: QueueItem[], running: boolean, stop: boolean, hidden: boolean, collapsed: boolean}}
+ */
+const importQueue = { items: [], running: false, stop: false, hidden: false, collapsed: false };
+
+const QUEUE_ICONS = {
+    pending: 'fa-regular fa-clock',
+    running: 'fa-solid fa-spinner fa-spin',
+    done: 'fa-solid fa-check',
+    warn: 'fa-solid fa-triangle-exclamation',
+    skipped: 'fa-solid fa-ban',
+    failed: 'fa-solid fa-xmark',
+};
+
+/** Draws the floating import queue panel from importQueue. */
+function renderImportPanel() {
+    let panel = $('#dupe_link_skip_queue');
+    if (!panel.length) {
+        panel = $(`<div id="dupe_link_skip_queue">
+            <div class="dls_queue_header">
+                <b class="dls_queue_title"></b>
+                <i class="dls_queue_collapse fa-solid fa-minus" title="Collapse"></i>
+                <i class="dls_queue_close fa-solid fa-xmark" title="Close"></i>
+            </div>
+            <div class="dls_queue_list"></div>
+            <div class="dls_queue_footer">
+                <div class="dls_queue_stop menu_button" title="Finish the current link, then skip the rest">Stop after this link</div>
+            </div>
+        </div>`).appendTo('body');
+        panel.find('.dls_queue_collapse').on('click', () => {
+            importQueue.collapsed = !importQueue.collapsed;
+            renderImportPanel();
+        });
+        panel.find('.dls_queue_close').on('click', () => {
+            importQueue.hidden = true;
+            renderImportPanel();
+        });
+        panel.find('.dls_queue_stop').on('click', () => {
+            importQueue.stop = true;
+            renderImportPanel();
+        });
+    }
+
+    const { items } = importQueue;
+    panel.toggle(!importQueue.hidden && items.length > 0);
+    panel.toggleClass('collapsed', importQueue.collapsed);
+    panel.find('.dls_queue_collapse')
+        .toggleClass('fa-minus', !importQueue.collapsed)
+        .toggleClass('fa-plus', importQueue.collapsed)
+        .attr('title', importQueue.collapsed ? 'Expand' : 'Collapse');
+
+    const finished = items.filter(i => i.state !== 'pending' && i.state !== 'running').length;
+    const current = items.find(i => i.state === 'running');
+    let title = `Import queue (${finished}/${items.length})`;
+    // Collapsed, the header is all that shows, so it carries the current step
+    if (importQueue.collapsed && current?.note) title += ` · ${current.note}`;
+    panel.find('.dls_queue_title').text(title);
+
+    panel.find('.dls_queue_footer').toggle(importQueue.running);
+    panel.find('.dls_queue_stop')
+        .text(importQueue.stop ? 'Stopping…' : 'Stop after this link')
+        .toggleClass('disabled', importQueue.stop);
+
+    const list = panel.find('.dls_queue_list').empty();
+    for (const item of items) {
+        const row = $('<div class="dls_queue_item"></div>').addClass(item.state);
+        row.append($('<i></i>').addClass(QUEUE_ICONS[item.state]));
+        const text = $('<div class="dls_queue_text"></div>');
+        text.append($('<div class="dls_queue_url"></div>').text(item.url).attr('title', item.url));
+        if (item.note) text.append($('<small class="dls_queue_note"></small>').text(item.note));
+        row.append(text);
+        list.append(row);
+    }
+    const running = list.find('.dls_queue_item.running')[0];
+    if (running) running.scrollIntoView({ block: 'nearest' });
+}
+
+/**
+ * Imports one queued link and records how it went on the item.
+ * @param {QueueItem} item
+ * @param {(load: boolean) => Promise<{keys: Set<string>, hashes: Set<string>}>|null} getExistingOnce
+ *   Library keys and hashes, shared across the run; loaded on first call with load, otherwise null until then
+ * @returns {Promise<'link'|'content'|null>} Why it was skipped as a duplicate, if it was
+ */
+async function importQueueItem(item, getExistingOnce) {
+    const settings = getSettings();
+    const { url, opts } = item;
+    const setStep = (text) => {
+        item.note = text;
+        renderImportPanel();
+    };
+    const finish = (state, note) => {
+        item.state = state;
+        item.note = note;
+    };
+
+    const key = normalizeSource(url);
+    // Lorebooks aren't characters; leave them alone
+    const isLorebook = key.startsWith('chublore:');
+    // Kept up to date even when this link doesn't check, for later links that do
+    const existing = await getExistingOnce(opts.preventDuplicates);
+
+    if (existing && key && !isLorebook && existing.keys.has(key)) {
+        finish('skipped', 'Duplicate link');
+        return 'link';
+    }
+
+    const before = new Set(characters.map(c => c.avatar));
+    let hash;
+
+    if (opts.contentCheck && !isLorebook) {
+        setStep('Downloading card');
+        const download = await downloadExternal(url);
+        if (!download) {
+            finish('failed', 'Download failed');
+            return null;
+        }
+
+        if (download.type === 'lorebook') {
+            setStep('Importing lorebook');
+            await importWorldInfo(download.file);
+            finish('done', 'Lorebook imported');
+            return null;
+        }
+        if (download.type !== 'character') {
+            toastr.warning('Unknown content type');
+            console.error('Unknown content type', download.type);
+            finish('failed', `Unknown content type: ${download.type}`);
+            return null;
+        }
+
+        setStep('Checking for duplicates');
+        hash = contentHash(await readCardFromFile(download.file));
+        if (hash && existing?.hashes.has(hash)) {
+            finish('skipped', 'Identical card already in library');
+            return 'content';
+        }
+        setStep('Importing');
+        await processDroppedFiles([download.file]);
+    } else {
+        setStep(isLorebook ? 'Importing lorebook' : 'Downloading and importing');
+        await importFromExternalUrl(url);
+    }
+
+    if (isLorebook) {
+        finish('done', 'Lorebook imported');
+        return null;
+    }
+    if (key) existing?.keys.add(key);
+    if (hash) existing?.hashes.add(hash);
+
+    const added = characters.find(c => !before.has(c.avatar));
+    if (!added) {
+        finish('failed', 'Nothing was imported (see ST\'s message)');
+        return null;
+    }
+    if (key) {
+        settings.imported[key] = added.avatar;
+        saveSettingsDebounced();
+    }
+    const { index } = await loadIndex();
+    // hash stays undefined if not computed, so the next "Load new" fills it in
+    index[added.avatar] = hash !== undefined ? { key, hash } : { key };
+    await sourceCache.setItem('index', index);
+
+    const failed = await importAssets(added, {
+        isChub: key.startsWith('chub:'),
+        downloadExpressions: opts.downloadExpressions,
+        localizeAssets: opts.localizeAssets,
+    }, setStep);
+    if (failed.length) finish('warn', `Imported ${added.name}; could not ${failed.join(', ')}`);
+    else finish('done', `Imported ${added.name}`);
+    return null;
+}
+
+/** Works through the queue until it is empty or stopped. */
+async function runImportQueue() {
+    importQueue.running = true;
+    importQueue.stop = false;
+    /** @type {Promise<{keys: Set<string>, hashes: Set<string>}>|null} */
+    let existing = null;
+    const getExistingOnce = (load) => load ? (existing ??= getExisting()) : existing;
+    const skippedLinks = [];
+    const skippedContent = [];
+
+    try {
+        let item;
+        while (!importQueue.stop && (item = importQueue.items.find(i => i.state === 'pending'))) {
+            item.state = 'running';
+            item.note = '';
+            renderImportPanel();
+            try {
+                const skipped = await importQueueItem(item, getExistingOnce);
+                if (skipped === 'link') skippedLinks.push(item.url);
+                if (skipped === 'content') skippedContent.push(item.url);
+            } catch (error) {
+                console.error('[Dupe Link Skip] Import failed for', item.url, error);
+                item.state = 'failed';
+                item.note = String(error?.message ?? error);
+            }
+            renderImportPanel();
+        }
+        for (const rest of importQueue.items.filter(i => i.state === 'pending')) {
+            rest.state = 'skipped';
+            rest.note = 'Stopped';
+        }
+    } finally {
+        importQueue.running = false;
+        importQueue.stop = false;
+        renderImportPanel();
+    }
+
+    publishOwnedDebounced();
+
+    const parts = [];
+    if (skippedLinks.length) parts.push(`${skippedLinks.length} duplicate link${skippedLinks.length === 1 ? '' : 's'}`);
+    if (skippedContent.length) parts.push(`${skippedContent.length} identical card${skippedContent.length === 1 ? '' : 's'}`);
+    if (parts.length) {
+        console.info('[Dupe Link Skip] Skipped duplicate links:', skippedLinks, 'identical cards:', skippedContent);
+        toastr.info(`Skipped ${parts.join(' and ')}.`, 'Import Characters');
     }
 }
 
@@ -1701,76 +1957,34 @@ async function onImportClick() {
     }
 
     const inputs = String(input).split('\n').map(x => x.trim()).filter(x => x.length > 0);
-    const contentCheck = preventDuplicates && settings.contentCheck;
-    const existing = preventDuplicates ? await getExisting() : { keys: new Set(), hashes: new Set() };
-    const skippedLinks = [];
-    const skippedContent = [];
+    const opts = { preventDuplicates, contentCheck: preventDuplicates && settings.contentCheck, downloadExpressions, localizeAssets };
 
+    // A new run starts with a fresh list
+    if (!importQueue.running) importQueue.items = [];
+    const queued = new Set(importQueue.items.filter(i => i.state === 'pending' || i.state === 'running').map(i => i.url));
+    let added = 0, repeated = 0;
     for (const url of inputs) {
-        const key = normalizeSource(url);
-        // Lorebooks aren't characters; leave them alone
-        const isLorebook = key.startsWith('chublore:');
-
-        if (preventDuplicates && key && !isLorebook && existing.keys.has(key)) {
-            skippedLinks.push(url);
+        if (queued.has(url)) {
+            repeated++;
             continue;
         }
-
-        const before = new Set(characters.map(c => c.avatar));
-        let hash;
-
-        if (contentCheck && !isLorebook) {
-            const download = await downloadExternal(url);
-            if (!download) continue;
-
-            if (download.type === 'lorebook') {
-                await importWorldInfo(download.file);
-                continue;
-            }
-            if (download.type !== 'character') {
-                toastr.warning('Unknown content type');
-                console.error('Unknown content type', download.type);
-                continue;
-            }
-
-            hash = contentHash(await readCardFromFile(download.file));
-            if (hash && existing.hashes.has(hash)) {
-                skippedContent.push(url);
-                continue;
-            }
-            await processDroppedFiles([download.file]);
-        } else {
-            await importFromExternalUrl(url);
-        }
-
-        if (isLorebook) continue;
-        if (key) existing.keys.add(key);
-        if (hash) existing.hashes.add(hash);
-
-        const added = characters.find(c => !before.has(c.avatar));
-        if (added) {
-            if (key) {
-                settings.imported[key] = added.avatar;
-                saveSettingsDebounced();
-            }
-            const { index } = await loadIndex();
-            // hash stays undefined if not computed, so the next "Load new" fills it in
-            index[added.avatar] = hash !== undefined ? { key, hash } : { key };
-            await sourceCache.setItem('index', index);
-
-            await importAssets(added, { isChub: key.startsWith('chub:'), downloadExpressions, localizeAssets });
-        }
+        queued.add(url);
+        importQueue.items.push({ url, opts, state: 'pending', note: '' });
+        added++;
     }
+    importQueue.hidden = false;
+    renderImportPanel();
 
-    publishOwnedDebounced();
-
-    const parts = [];
-    if (skippedLinks.length) parts.push(`${skippedLinks.length} duplicate link${skippedLinks.length === 1 ? '' : 's'}`);
-    if (skippedContent.length) parts.push(`${skippedContent.length} identical card${skippedContent.length === 1 ? '' : 's'}`);
-    if (parts.length) {
-        console.info('[Dupe Link Skip] Skipped duplicate links:', skippedLinks, 'identical cards:', skippedContent);
-        toastr.info(`Skipped ${parts.join(' and ')}.`, 'Import Characters');
+    const repeatedText = repeated ? ` ${repeated} already queued.` : '';
+    if (importQueue.running) {
+        // Importing more means carry on
+        importQueue.stop = false;
+        renderImportPanel();
+        toastr.info(`Added ${added} link${added === 1 ? '' : 's'} to the running import.${repeatedText}`, 'Import Characters');
+        return;
     }
+    if (repeatedText) toastr.info(repeatedText.trim(), 'Import Characters');
+    await runImportQueue();
 }
 
 eventSource.on(event_types.APP_READY, async () => {

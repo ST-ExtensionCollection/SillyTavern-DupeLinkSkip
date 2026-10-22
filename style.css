@@ -1,0 +1,107 @@
+#dupe_link_skip_queue {
+    position: fixed;
+    right: 10px;
+    bottom: 10px;
+    width: min(420px, calc(100vw - 20px));
+    max-height: 50vh;
+    z-index: 9999;
+    display: flex;
+    flex-direction: column;
+    background-color: var(--SmartThemeBlurTintColor);
+    backdrop-filter: blur(var(--SmartThemeBlurStrength));
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 10px;
+    box-shadow: 0 0 10px var(--SmartThemeShadowColor);
+    color: var(--SmartThemeBodyColor);
+    font-size: calc(var(--mainFontSize) * 0.9);
+}
+
+#dupe_link_skip_queue .dls_queue_header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+}
+
+#dupe_link_skip_queue .dls_queue_title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#dupe_link_skip_queue .dls_queue_collapse,
+#dupe_link_skip_queue .dls_queue_close {
+    cursor: pointer;
+    opacity: 0.7;
+}
+
+#dupe_link_skip_queue .dls_queue_collapse:hover,
+#dupe_link_skip_queue .dls_queue_close:hover {
+    opacity: 1;
+}
+
+#dupe_link_skip_queue .dls_queue_list {
+    overflow-y: auto;
+    padding: 0 10px;
+    border-top: 1px solid var(--SmartThemeBorderColor);
+}
+
+#dupe_link_skip_queue .dls_queue_item {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 4px 0;
+}
+
+#dupe_link_skip_queue .dls_queue_item > i {
+    width: 1em;
+    flex-shrink: 0;
+    text-align: center;
+}
+
+#dupe_link_skip_queue .dls_queue_item.pending {
+    opacity: 0.6;
+}
+
+#dupe_link_skip_queue .dls_queue_item.done > i {
+    color: #5c5;
+}
+
+#dupe_link_skip_queue .dls_queue_item.warn > i {
+    color: #db3;
+}
+
+#dupe_link_skip_queue .dls_queue_item.failed > i {
+    color: #e55;
+}
+
+#dupe_link_skip_queue .dls_queue_text {
+    min-width: 0;
+    flex: 1;
+}
+
+#dupe_link_skip_queue .dls_queue_url {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+#dupe_link_skip_queue .dls_queue_note {
+    display: block;
+    opacity: 0.75;
+    overflow-wrap: anywhere;
+}
+
+#dupe_link_skip_queue .dls_queue_footer {
+    display: flex;
+    justify-content: flex-end;
+    padding: 4px 10px 6px;
+    border-top: 1px solid var(--SmartThemeBorderColor);
+}
+
+#dupe_link_skip_queue.collapsed .dls_queue_list,
+#dupe_link_skip_queue.collapsed .dls_queue_footer {
+    display: none !important;
+}

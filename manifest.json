@@ -4,7 +4,7 @@
     "requires": [],
     "optional": [],
     "js": "index.js",
-    "css": "",
+    "css": "style.css",
     "author": "Rojikku",
     "version": "1.0.0",
     "homePage": ""
