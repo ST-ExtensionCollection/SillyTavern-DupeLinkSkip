@@ -22,12 +22,18 @@ const FETCH_CONCURRENCY = 6;
 const sourceCache = localforage.createInstance({ name: 'SillyTavern_DupeLinkSkip' });
 /** @type {Promise<void>|null} */
 let refreshPromise = null;
-/** @type {{stop: boolean}|null} */
+/** @type {{stop: boolean, kind?: 'retry'}|null} Fetch assets or Retry failed images, whichever is running */
 let assetJob = null;
 // Set if the browser can't reach Chub's API directly (CORS); then go through ST's server
 let chubApiBlocked = false;
 // Hosts that blocked a direct download (CORS); later downloads from them go straight through ST's proxy
 const corsBlockedHosts = new Set();
+// Connection failures in a row per host; after HOST_FAILURE_LIMIT the host is skipped until hostDownUntil
+const hostFailures = new Map();
+/** @type {Map<string, number>} host -> time until which it's skipped */
+const hostDownUntil = new Map();
+const HOST_FAILURE_LIMIT = 3;
+const HOST_DOWN_MS = 10 * 60 * 1000;
 
 function getSettings() {
     if (!extension_settings[MODULE]) {
@@ -255,6 +261,36 @@ async function fetchFullCharacter(avatar) {
 class RateLimitError extends Error {}
 // Saving to ST failed (e.g. disk full), as opposed to the remote file being unavailable
 class LocalSaveError extends Error {}
+// The server didn't answer in time
+class TimeoutError extends Error {}
+// The site failed several times in a row, so it's skipped for a while
+class HostDownError extends Error {}
+
+/**
+ * fetch() that gives up when the server doesn't answer: after `headers` ms
+ * without a response, or `body` ms more to finish downloading.
+ * @param {string} url
+ * @param {RequestInit} [options]
+ * @param {{headers?: number, body?: number}} [timeouts]
+ * @returns {Promise<Response>} Response whose body is already loaded
+ */
+async function fetchWithTimeout(url, options = {}, { headers = 15000, body = 300000 } = {}) {
+    const controller = new AbortController();
+    let timer = setTimeout(() => controller.abort(), headers);
+    try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(timer);
+        timer = setTimeout(() => controller.abort(), body);
+        // Read the body now so the timeout covers it
+        const blob = await response.blob();
+        return new Response(blob, { status: response.status, statusText: response.statusText, headers: response.headers });
+    } catch (error) {
+        if (controller.signal.aborted) throw new TimeoutError(`No response in time from ${url}`);
+        throw error;
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 /**
  * @param {any} chub The card's extensions.chub
@@ -279,7 +315,7 @@ async function fetchChubExtension(fullPath) {
     if (!chubApiBlocked) {
         try {
             const path = fullPath.split('/').map(encodeURIComponent).join('/');
-            const response = await fetch(`https://api.chub.ai/api/characters/${path}?full=true`, { cache: 'no-cache' });
+            const response = await fetchWithTimeout(`https://api.chub.ai/api/characters/${path}?full=true`, { cache: 'no-cache' });
             if (response.status === 429) throw new RateLimitError('429 from Chub API');
             if (response.status === 404) return null;
             if (!response.ok) throw new Error(`Chub API: ${response.status} ${response.statusText}`);
@@ -302,7 +338,7 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const CHUB_STOCK_EXPRESSIONS = /lfs\.charhub\.io\/lfs\/88\/emotions\//;
 
 async function fetchBlob(url) {
-    const response = await fetch(url, { cache: 'no-cache' });
+    const response = await fetchWithTimeout(url, { cache: 'no-cache' });
     if (response.status === 429) throw new RateLimitError(`429 from ${url}`);
     if (!response.ok) throw new Error(`${response.status} ${response.statusText} from ${url}`);
     return response.blob();
@@ -633,22 +669,59 @@ const IMAGE_FORMATS = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': '
  */
 async function fetchExternal(url) {
     const host = new URL(url, location.href).host;
+    if (isHostDown(host)) throw new HostDownError(`${host} is not responding; skipped for now`);
+    const connectionFailed = (error) => {
+        const count = (hostFailures.get(host) ?? 0) + 1;
+        hostFailures.set(host, count);
+        if (count >= HOST_FAILURE_LIMIT) {
+            hostFailures.delete(host);
+            hostDownUntil.set(host, Date.now() + HOST_DOWN_MS);
+            console.warn(`[Dupe Link Skip] ${host} not responding, skipping it for ${HOST_DOWN_MS / 60000} minutes`);
+        }
+        return error;
+    };
+
     if (!corsBlockedHosts.has(host)) {
         try {
-            return await fetchBlob(url);
+            const blob = await fetchBlob(url);
+            hostFailures.delete(host);
+            return blob;
         } catch (error) {
-            if (!(error instanceof TypeError)) throw error;
+            // No answer at all; going through ST would only wait again
+            if (error instanceof TimeoutError) throw connectionFailed(error);
+            if (!(error instanceof TypeError)) {
+                // It answered, just not with the file
+                hostFailures.delete(host);
+                throw error;
+            }
             corsBlockedHosts.add(host);
         }
     }
-    const response = await fetch(`/proxy/${url}`, { cache: 'no-cache' });
+
+    let response;
+    try {
+        response = await fetchWithTimeout(`/proxy/${url}`, { cache: 'no-cache' });
+    } catch (error) {
+        throw connectionFailed(error);
+    }
     // ST answers 404 with this message when the proxy is off
     if (response.status === 404 && (await response.clone().text()).includes('CORS proxy is disabled')) {
         throw new Error(`${host} blocks direct downloads (CORS) and ST's CORS proxy is off (enableCorsProxy in config.yaml)`);
     }
+    // ST's proxy answers with a server error when it couldn't reach the site
+    if ([500, 502, 503, 504].includes(response.status)) throw connectionFailed(new Error(`${response.status} ${response.statusText} from ${url}`));
+    hostFailures.delete(host);
     if (response.status === 429) throw new RateLimitError(`429 from ${url}`);
     if (!response.ok) throw new Error(`${response.status} ${response.statusText} from ${url}`);
     return response.blob();
+}
+
+/** Whether a host failed too often recently and is being skipped */
+function isHostDown(host) {
+    const until = hostDownUntil.get(host);
+    if (until && until > Date.now()) return true;
+    hostDownUntil.delete(host);
+    return false;
 }
 
 function imageFormat(blob, url) {
@@ -736,7 +809,7 @@ async function associateGallery(character) {
 async function fetchChubGallery(projectId) {
     const urls = [];
     for (let page = 1; page <= 10; page++) {
-        const response = await fetch(`https://api.chub.ai/api/gallery/project/${projectId}?nsfw=true&page=${page}&limit=50`, { cache: 'no-cache' });
+        const response = await fetchWithTimeout(`https://api.chub.ai/api/gallery/project/${projectId}?nsfw=true&page=${page}&limit=50`, { cache: 'no-cache' });
         if (response.status === 429) throw new RateLimitError('429 from Chub gallery');
         if (response.status === 404) break;
         if (!response.ok) throw new Error(`Chub gallery: ${response.status} ${response.statusText}`);
@@ -909,12 +982,17 @@ async function localizeImages(character, { gap = 0, onProgress } = {}) {
     for (const text of [...texts.map(([, v]) => v), ...greetings]) {
         for (const m of String(text ?? '').matchAll(EMBEDDED_IMAGE)) urls.add(m[2] ?? m[5]);
     }
-    if (!urls.size) return { saved: 0, failed: 0 };
+    if (!urls.size) {
+        await recordImageFailures(character.avatar, {});
+        return { saved: 0, failed: 0 };
+    }
 
     const folder = avatarFolder(character.avatar);
     const existing = new Set(await listGalleryImages(folder));
     /** @type {Record<string, string>} */
     const local = {};
+    /** @type {Record<string, {t: number, reason: string}>} Downloads that failed, to retry later */
+    const failures = {};
     let failed = 0;
     /** @type {Error|null} */
     let saveError = null;
@@ -945,9 +1023,11 @@ async function localizeImages(character, { gap = 0, onProgress } = {}) {
                 saveError = error;
                 break;
             }
+            failures[url] = { t: Date.now(), reason: String(error?.message ?? error) };
         }
-        if (gap) await sleep(gap);
+        if (gap && !isHostDown(new URL(url).host)) await sleep(gap);
     }
+    if (!saveError) await recordImageFailures(character.avatar, failures);
     if (!Object.keys(local).length) {
         if (saveError) throw saveError;
         return { saved: 0, failed };
@@ -1284,6 +1364,29 @@ async function markExpressionsChecked(avatar) {
  * avatar -> which other parts (gallery, lorebooks, images, links) have been done, with timestamps.
  * @returns {Promise<Record<string, {gallery?: number, lorebooks?: number, images?: number, links?: number}>>}
  */
+/**
+ * avatar -> card image URLs that couldn't be downloaded, for Retry failed images.
+ * @returns {Promise<Record<string, Record<string, {t: number, reason: string}>>>}
+ */
+async function loadImageFailures() {
+    return (await sourceCache.getItem('imageFailures')) ?? {};
+}
+
+// Serializes read-modify-write of the failure list (imports and jobs can overlap)
+let imageFailuresWrite = Promise.resolve();
+
+/** Replaces a character's failed image list with this run's (none removes it). */
+function recordImageFailures(avatar, failures) {
+    imageFailuresWrite = imageFailuresWrite.then(async () => {
+        const all = await loadImageFailures();
+        if (Object.keys(failures).length) all[avatar] = failures;
+        else if (all[avatar]) delete all[avatar];
+        else return;
+        await sourceCache.setItem('imageFailures', all);
+    }).catch(error => console.error('[Dupe Link Skip] Could not save failed image list', error));
+    return imageFailuresWrite.then(() => updateFailedCount());
+}
+
 async function loadAssetsChecked() {
     return (await sourceCache.getItem('assetsChecked')) ?? {};
 }
@@ -1405,31 +1508,132 @@ async function backfillAssets(job, onStatus) {
     return result;
 }
 
+/** Shows how many failed card images are waiting on the retry button. */
+async function updateFailedCount() {
+    const avatars = new Set(characters.map(c => c.avatar));
+    const live = Object.entries(await loadImageFailures()).filter(([avatar]) => avatars.has(avatar));
+    const images = live.reduce((n, [, urls]) => n + Object.keys(urls).length, 0);
+    $('#dupe_link_skip_failed_count').text(live.length ? `(${live.length} card${live.length === 1 ? '' : 's'}, ${images} image${images === 1 ? '' : 's'})` : '');
+}
+
 /**
- * Clears the "card images done" mark on every character, so the next Fetch
- * assets retries images that couldn't be saved. Cards whose images are all
- * local already have no remote links left, so they're quick to recheck.
+ * Finds card images that failed before failures were recorded: cards whose
+ * images were already processed but still link to online images. Reads the
+ * cards from ST only; nothing is downloaded.
+ * @param {(text: string) => void} onStatus
  */
-async function onRetryImagesClick() {
+async function scanOldImageFailures(onStatus) {
+    const checked = await loadAssetsChecked();
+    const failures = await loadImageFailures();
+    const queue = characters.filter(c => checked[c.avatar]?.images && !failures[c.avatar]).map(c => c.avatar);
+    const total = queue.length;
+    let done = 0;
+    const found = {};
+    const worker = async () => {
+        while (queue.length) {
+            const avatar = queue.pop();
+            try {
+                const data = (await fetchFullCharacter(avatar)).data ?? {};
+                const texts = [...TEXT_FIELDS.map(f => data[f]), ...(Array.isArray(data.alternate_greetings) ? data.alternate_greetings : [])];
+                const urls = {};
+                for (const text of texts) {
+                    for (const m of String(text ?? '').matchAll(EMBEDDED_IMAGE)) urls[m[2] ?? m[5]] = { t: 0, reason: 'failed before failures were recorded' };
+                }
+                if (Object.keys(urls).length) found[avatar] = urls;
+            } catch (error) {
+                console.warn('[Dupe Link Skip] Could not read character', avatar, error);
+            }
+            onStatus(`Looking for earlier failed images... ${++done} / ${total}`);
+        }
+    };
+    await Promise.all(Array.from({ length: FETCH_CONCURRENCY }, worker));
+    imageFailuresWrite = imageFailuresWrite.then(async () => {
+        await sourceCache.setItem('imageFailures', { ...(await loadImageFailures()), ...found });
+    });
+    await imageFailuresWrite;
+    await sourceCache.setItem('imageFailuresScanned', Date.now());
+}
+
+/**
+ * Tries the card images that couldn't be downloaded again, only on the
+ * characters that have some. Characters whose failed images are all on a site
+ * that's currently being skipped wait for the next try.
+ */
+async function onRetryFailedImagesClick() {
+    const button = $('#dupe_link_skip_retry_images');
+    const status = $('#dupe_link_skip_expr_status');
     if (assetJob) {
-        toastr.warning('Stop the running job first.', 'Dupe Link Skip');
+        if (assetJob.kind === 'retry') {
+            assetJob.stop = true;
+            button.text('Stopping...');
+        } else {
+            toastr.warning('Stop the running job first.', 'Dupe Link Skip');
+        }
         return;
     }
-    const checked = await loadAssetsChecked();
-    let count = 0;
-    for (const entry of Object.values(checked)) {
-        if (entry.images) {
-            delete entry.images;
-            count++;
+
+    const job = assetJob = { stop: false, kind: 'retry' };
+    const label = button.html();
+    button.html('<i class="fa-solid fa-stop"></i> Stop');
+    const onStatus = (text) => status.text(text);
+    try {
+        if (!(await sourceCache.getItem('imageFailuresScanned'))) await scanOldImageFailures(onStatus);
+
+        const failures = await loadImageFailures();
+        const byAvatar = new Map(characters.map(c => [c.avatar, c]));
+        const queue = Object.keys(failures).filter(a => byAvatar.has(a));
+        const result = { done: 0, saved: 0, failed: 0, skipped: 0, errors: 0 };
+        for (const avatar of queue) {
+            if (job.stop) break;
+            onStatus(`Retrying failed images... ${result.done} / ${queue.length} (${result.saved} saved, ${result.failed} still failing)`);
+            const hosts = Object.keys(failures[avatar]).map(url => {
+                try {
+                    return new URL(url).host;
+                } catch {
+                    return '';
+                }
+            });
+            if (hosts.every(h => h && isHostDown(h))) {
+                result.skipped++;
+            } else {
+                try {
+                    const { saved, failed } = await localizeImages(await fetchFullCharacter(avatar), { gap: 250 });
+                    result.saved += saved;
+                    result.failed += failed;
+                } catch (error) {
+                    console.warn('[Dupe Link Skip] Could not retry images for', avatar, error);
+                    result.errors++;
+                    if (error instanceof RateLimitError) {
+                        onStatus('Rate limited, waiting a minute...');
+                        await sleep(60000);
+                    }
+                }
+            }
+            result.done++;
         }
+
+        const summary = `Retried ${result.done} / ${queue.length} characters: ${result.saved} images saved, ${result.failed} still failing` +
+            (result.skipped ? `, ${result.skipped} characters skipped because their site isn't responding` : '') +
+            (result.errors ? `, ${result.errors} characters failed` : '') + '.';
+        status.text(summary);
+        toastr.success(summary, 'Dupe Link Skip');
+    } catch (error) {
+        console.error('[Dupe Link Skip] Retry failed images failed', error);
+        status.text(`Failed: ${error}`);
+    } finally {
+        assetJob = null;
+        button.html(label);
+        await updateFailedCount();
     }
-    await sourceCache.setItem('assetsChecked', checked);
-    toastr.info(`${count} characters will have their card images rechecked. Click Fetch assets with Card images checked.`, 'Dupe Link Skip');
 }
 
 async function onAssetsClick() {
     const button = $('#dupe_link_skip_expr_fetch');
     const status = $('#dupe_link_skip_expr_status');
+    if (assetJob?.kind === 'retry') {
+        toastr.warning('Stop Retry failed images first.', 'Dupe Link Skip');
+        return;
+    }
     if (assetJob) {
         assetJob.stop = true;
         button.text('Stopping...');
@@ -2174,7 +2378,7 @@ async function addSettingsPanel() {
             });
     }
     $('#dupe_link_skip_expr_fetch').on('click', () => onAssetsClick());
-    $('#dupe_link_skip_retry_images').on('click', () => onRetryImagesClick());
+    $('#dupe_link_skip_retry_images').on('click', () => onRetryFailedImagesClick());
     $('#dupe_link_skip_links_drawer .inline-drawer-toggle').on('click', () => renderAssetLinks());
     $('#dupe_link_skip_blacklist')
         .val(getSettings().linkBlacklist.join('\n'))
@@ -2187,8 +2391,12 @@ async function addSettingsPanel() {
     $('#dupe_link_skip_rebuild').on('click', () => onRefreshClick(true));
     $('#dupe_link_skip_flag_dupes').on('click', () => onFlagDuplicatesClick());
     // Keep status current when the drawer is opened
-    $('#dupe_link_skip_settings .inline-drawer-toggle').on('click', () => updateStatus());
+    $('#dupe_link_skip_settings .inline-drawer-toggle').on('click', () => {
+        updateStatus();
+        updateFailedCount();
+    });
     await updateStatus();
+    await updateFailedCount();
     await pruneAssetLinks();
 }
 
@@ -2247,8 +2455,10 @@ async function importAssets(character, { isChub, downloadExpressions, localizeAs
     if (localizeAssets) {
         await step('save card images', async () => {
             onStep('Card images');
-            await localizeImages(full, { onProgress: progress('Card images') });
+            const { failed: missing } = await localizeImages(full, { onProgress: progress('Card images') });
             await markAssetsChecked(character.avatar, ['images']);
+            // Recorded for Retry failed images
+            if (missing) failed.push(`download ${missing} card image${missing === 1 ? '' : 's'}`);
         });
     }
     return failed;
@@ -2603,7 +2813,7 @@ eventSource.on(event_types.CHARACTER_RENAMED, async (oldAvatar, newAvatar) => {
         override.name = avatarFolder(newAvatar);
         saveSettingsDebounced();
     }
-    for (const key of ['packs', 'expressionsChecked', 'assetsChecked', 'assetLinks']) {
+    for (const key of ['packs', 'expressionsChecked', 'assetsChecked', 'assetLinks', 'imageFailures']) {
         const map = (await sourceCache.getItem(key)) ?? {};
         if (map[oldAvatar] === undefined) continue;
         map[newAvatar] = map[oldAvatar];
@@ -2628,7 +2838,7 @@ eventSource.on(event_types.CHARACTER_DELETED, async ({ character }) => {
         delete packs[avatar];
         await sourceCache.setItem('packs', packs);
     }
-    for (const key of ['index', 'expressionsChecked', 'assetsChecked', 'assetLinks']) {
+    for (const key of ['index', 'expressionsChecked', 'assetsChecked', 'assetLinks', 'imageFailures']) {
         const map = (await sourceCache.getItem(key)) ?? {};
         if (map[avatar] === undefined) continue;
         delete map[avatar];
