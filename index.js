@@ -26,6 +26,8 @@ let refreshPromise = null;
 let assetJob = null;
 // Set if the browser can't reach Chub's API directly (CORS); then go through ST's server
 let chubApiBlocked = false;
+// Hosts that blocked a direct download (CORS); later downloads from them go straight through ST's proxy
+const corsBlockedHosts = new Set();
 
 function getSettings() {
     if (!extension_settings[MODULE]) {
@@ -574,7 +576,7 @@ async function importChubExpressions(character, chub, { gap = 0 } = {}) {
         if (!entries.length) {
             // Labels unlisted; fall back to the pack's zip if it has one
             if (pack.compressed && !Object.keys(pack.expressions ?? {}).length && !(await getSprites(folder)).length) {
-                const count = await uploadSpriteZip(folder, await fetchBlob(pack.compressed));
+                const count = await uploadSpriteZip(folder, await fetchExternal(pack.compressed));
                 if (count) writtenFolders.push(folder);
                 written += count;
             }
@@ -590,7 +592,7 @@ async function importChubExpressions(character, chub, { gap = 0 } = {}) {
 
         for (const [label, url] of entries) {
             if (taken.has(label.toLowerCase())) continue;
-            const blob = await fetchBlob(url);
+            const blob = await fetchExternal(url);
             if (gap) await sleep(gap);
             const hash = await blobHash(blob);
             if (knownHashes.has(hash) && !ownHashes.has(hash)) continue;
@@ -624,12 +626,23 @@ const IMAGE_FORMATS = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': '
  * @returns {Promise<Blob>}
  */
 async function fetchExternal(url) {
-    try {
-        return await fetchBlob(url);
-    } catch (error) {
-        if (!(error instanceof TypeError)) throw error;
-        return await fetchBlob(`/proxy/${url}`);
+    const host = new URL(url, location.href).host;
+    if (!corsBlockedHosts.has(host)) {
+        try {
+            return await fetchBlob(url);
+        } catch (error) {
+            if (!(error instanceof TypeError)) throw error;
+            corsBlockedHosts.add(host);
+        }
     }
+    const response = await fetch(`/proxy/${url}`, { cache: 'no-cache' });
+    // ST answers 404 with this message when the proxy is off
+    if (response.status === 404 && (await response.clone().text()).includes('CORS proxy is disabled')) {
+        throw new Error(`${host} blocks direct downloads (CORS) and ST's CORS proxy is off (enableCorsProxy in config.yaml)`);
+    }
+    if (response.status === 429) throw new RateLimitError(`429 from ${url}`);
+    if (!response.ok) throw new Error(`${response.status} ${response.statusText} from ${url}`);
+    return response.blob();
 }
 
 function imageFormat(blob, url) {
@@ -1649,6 +1662,17 @@ async function onImportClick() {
             tooltip: 'Download the Chub gallery and images linked in the card text into the character\'s gallery folder, and point the card at the local copies',
             defaultState: settings.localizeAssets,
         }],
+    });
+    // Start a new line after a paste, ready for the next URL
+    $(popup.mainInput).on('paste', function () {
+        setTimeout(() => {
+            const pos = this.selectionEnd;
+            if (this.value[pos - 1] === '\n') return;
+            if (this.value[pos] !== '\n') {
+                this.value = this.value.slice(0, pos) + '\n' + this.value.slice(pos);
+            }
+            this.selectionStart = this.selectionEnd = pos + 1;
+        });
     });
     const input = await popup.show();
 
