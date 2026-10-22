@@ -161,3 +161,22 @@
     color: #db3;
     opacity: 1;
 }
+
+.dls_dupes .dls_clickable {
+    cursor: pointer;
+}
+
+.dls_dupes .dls_failed_links {
+    font-size: 0.85em;
+    overflow-wrap: anywhere;
+}
+
+.dls_dupes .dls_failed_links summary {
+    cursor: pointer;
+    opacity: 0.75;
+}
+
+.dls_dupes .dls_failed_reason {
+    opacity: 0.65;
+    margin-bottom: 4px;
+}

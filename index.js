@@ -1,4 +1,4 @@
-import { characters, deleteCharacter, eventSource, event_types, getRequestHeaders, processDroppedFiles, saveSettingsDebounced, this_chid } from '/script.js';
+import { characters, deleteCharacter, eventSource, event_types, getRequestHeaders, processDroppedFiles, saveSettingsDebounced, selectCharacterById, this_chid } from '/script.js';
 import { extension_settings, renderExtensionTemplateAsync } from '/scripts/extensions.js';
 import { Popup, POPUP_RESULT, POPUP_TYPE } from '/scripts/popup.js';
 import { renderTemplateAsync } from '/scripts/templates.js';
@@ -1516,6 +1516,57 @@ async function updateFailedCount() {
     $('#dupe_link_skip_failed_count').text(live.length ? `(${live.length} card${live.length === 1 ? '' : 's'}, ${images} image${images === 1 ? '' : 's'})` : '');
 }
 
+/** Lists the characters with failed card images, with their pictures, names and failed links. */
+async function onViewFailedImagesClick() {
+    const byAvatar = new Map(characters.map(c => [c.avatar, c]));
+    const entries = Object.entries(await loadImageFailures())
+        .filter(([avatar]) => byAvatar.has(avatar))
+        .map(([avatar, urls]) => ({ character: byAvatar.get(avatar), urls: Object.entries(urls) }))
+        .sort((a, b) => b.urls.length - a.urls.length || a.character.name.localeCompare(b.character.name));
+    const scanned = !!(await sourceCache.getItem('imageFailuresScanned'));
+    const unscannedNote = 'Images that failed before failures were remembered are found the first time you click Retry failed images.';
+
+    if (!entries.length) {
+        toastr.info(`No failed card images.${scanned ? '' : ` ${unscannedNote}`}`, 'Dupe Link Skip');
+        return;
+    }
+
+    const images = entries.reduce((n, e) => n + e.urls.length, 0);
+    const root = $('<div class="dls_dupes"></div>');
+    root.append($('<h3></h3>').text(`${entries.length} character${entries.length === 1 ? '' : 's'}, ${images} failed image${images === 1 ? '' : 's'}`));
+    if (!scanned) root.append($('<small></small>').text(unscannedNote));
+
+    let popup;
+    const open = (character) => async () => {
+        await popup.completeCancelled();
+        await selectCharacterById(characters.indexOf(character));
+    };
+    for (const { character, urls } of entries) {
+        const lastTried = Math.max(...urls.map(([, f]) => f.t ?? 0));
+        const when = lastTried ? `last tried ${new Date(lastTried).toLocaleString()}` : 'from before failures were recorded';
+        const row = $('<div class="dls_dupe_row"></div>');
+        row.append($('<img loading="lazy" alt="" class="dls_clickable">')
+            .attr('src', `/thumbnail?type=avatar&file=${encodeURIComponent(character.avatar)}`)
+            .attr('title', 'Open character')
+            .on('click', open(character)));
+        const text = $('<div class="dls_dupe_text"></div>');
+        text.append($('<div class="dls_clickable"></div>').text(character.name).attr('title', 'Open character').on('click', open(character)));
+        text.append($('<small></small>').text(`${urls.length} image${urls.length === 1 ? '' : 's'} · ${when}`));
+        const links = $('<details class="dls_failed_links"></details>').append($('<summary></summary>').text('Links'));
+        for (const [url, failure] of urls) {
+            const item = $('<div></div>');
+            item.append($('<a target="_blank" rel="noopener noreferrer"></a>').attr('href', url).text(url));
+            if (failure.reason) item.append($('<div class="dls_failed_reason"></div>').text(failure.reason));
+            links.append(item);
+        }
+        text.append(links);
+        root.append(row.append(text));
+    }
+
+    popup = new Popup(root, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true });
+    await popup.show();
+}
+
 /**
  * Finds card images that failed before failures were recorded: cards whose
  * images were already processed but still link to online images. Reads the
@@ -2379,6 +2430,7 @@ async function addSettingsPanel() {
     }
     $('#dupe_link_skip_expr_fetch').on('click', () => onAssetsClick());
     $('#dupe_link_skip_retry_images').on('click', () => onRetryFailedImagesClick());
+    $('#dupe_link_skip_view_failed').on('click', () => onViewFailedImagesClick());
     $('#dupe_link_skip_links_drawer .inline-drawer-toggle').on('click', () => renderAssetLinks());
     $('#dupe_link_skip_blacklist')
         .val(getSettings().linkBlacklist.join('\n'))
