@@ -22,7 +22,7 @@ const FETCH_CONCURRENCY = 6;
 const sourceCache = localforage.createInstance({ name: 'SillyTavern_DupeLinkSkip' });
 /** @type {Promise<void>|null} */
 let refreshPromise = null;
-/** @type {{stop: boolean, kind?: 'retry'}|null} Fetch assets or Retry failed images, whichever is running */
+/** @type {{stop: boolean, kind?: 'retry'|'scan'}|null} Fetch assets, Retry failed images or its Shift+click scan, whichever is running */
 let assetJob = null;
 // Set if the browser can't reach Chub's API directly (CORS); then go through ST's server
 let chubApiBlocked = false;
@@ -1572,23 +1572,28 @@ async function onViewFailedImagesClick() {
  * images were already processed but still link to online images. Reads the
  * cards from ST only; nothing is downloaded.
  * @param {(text: string) => void} onStatus
+ * @param {{everyCard?: boolean, job?: {stop: boolean}}} [options] everyCard: read every
+ *   card, including ones whose images were never processed or were interrupted
+ * @returns {Promise<{cards: number, images: number}>} Newly listed
  */
-async function scanOldImageFailures(onStatus) {
+async function scanOldImageFailures(onStatus, { everyCard = false, job = null } = {}) {
     const checked = await loadAssetsChecked();
     const failures = await loadImageFailures();
-    const queue = characters.filter(c => checked[c.avatar]?.images && !failures[c.avatar]).map(c => c.avatar);
+    const queue = characters
+        .filter(c => everyCard || (checked[c.avatar]?.images && !failures[c.avatar]))
+        .map(c => c.avatar);
     const total = queue.length;
     let done = 0;
     const found = {};
     const worker = async () => {
-        while (queue.length) {
+        while (queue.length && !job?.stop) {
             const avatar = queue.pop();
             try {
                 const data = (await fetchFullCharacter(avatar)).data ?? {};
                 const texts = [...TEXT_FIELDS.map(f => data[f]), ...(Array.isArray(data.alternate_greetings) ? data.alternate_greetings : [])];
                 const urls = {};
                 for (const text of texts) {
-                    for (const m of String(text ?? '').matchAll(EMBEDDED_IMAGE)) urls[m[2] ?? m[5]] = { t: 0, reason: 'failed before failures were recorded' };
+                    for (const m of String(text ?? '').matchAll(EMBEDDED_IMAGE)) urls[m[2] ?? m[5]] = { t: 0, reason: 'still online when the cards were scanned' };
                 }
                 if (Object.keys(urls).length) found[avatar] = urls;
             } catch (error) {
@@ -1598,11 +1603,48 @@ async function scanOldImageFailures(onStatus) {
         }
     };
     await Promise.all(Array.from({ length: FETCH_CONCURRENCY }, worker));
+
+    const added = { cards: 0, images: 0 };
     imageFailuresWrite = imageFailuresWrite.then(async () => {
-        await sourceCache.setItem('imageFailures', { ...(await loadImageFailures()), ...found });
+        const all = await loadImageFailures();
+        for (const [avatar, urls] of Object.entries(found)) {
+            // Links already listed keep their recorded failure
+            const fresh = Object.entries(urls).filter(([url]) => !all[avatar]?.[url]);
+            if (!fresh.length) continue;
+            if (!all[avatar]) added.cards++;
+            added.images += fresh.length;
+            all[avatar] = { ...Object.fromEntries(fresh), ...all[avatar] };
+        }
+        await sourceCache.setItem('imageFailures', all);
     });
     await imageFailuresWrite;
-    await sourceCache.setItem('imageFailuresScanned', Date.now());
+    if (!job?.stop) await sourceCache.setItem('imageFailuresScanned', Date.now());
+    return added;
+}
+
+/**
+ * Shift+click on Retry failed images: reads every card and lists the ones that
+ * still link to online images, without downloading anything.
+ */
+async function onFindFailedImagesClick() {
+    const button = $('#dupe_link_skip_retry_images');
+    const status = $('#dupe_link_skip_expr_status');
+    const job = assetJob = { stop: false, kind: 'scan' };
+    const label = button.html();
+    button.html('<i class="fa-solid fa-stop"></i> Stop');
+    try {
+        const { cards, images } = await scanOldImageFailures(text => status.text(text.replace('Looking for earlier failed images', 'Reading every card for online images')), { everyCard: true, job });
+        const summary = `${job.stop ? 'Stopped. ' : ''}Added ${cards} character${cards === 1 ? '' : 's'} and ${images} image${images === 1 ? '' : 's'} to the failed list.`;
+        status.text(summary);
+        toastr.success(summary, 'Dupe Link Skip');
+    } catch (error) {
+        console.error('[Dupe Link Skip] Finding failed images failed', error);
+        status.text(`Failed: ${error}`);
+    } finally {
+        assetJob = null;
+        button.html(label);
+        await updateFailedCount();
+    }
 }
 
 /**
@@ -1610,11 +1652,11 @@ async function scanOldImageFailures(onStatus) {
  * characters that have some. Characters whose failed images are all on a site
  * that's currently being skipped wait for the next try.
  */
-async function onRetryFailedImagesClick() {
+async function onRetryFailedImagesClick(event) {
     const button = $('#dupe_link_skip_retry_images');
     const status = $('#dupe_link_skip_expr_status');
     if (assetJob) {
-        if (assetJob.kind === 'retry') {
+        if (assetJob.kind === 'retry' || assetJob.kind === 'scan') {
             assetJob.stop = true;
             button.text('Stopping...');
         } else {
@@ -1622,6 +1664,8 @@ async function onRetryFailedImagesClick() {
         }
         return;
     }
+
+    if (event?.shiftKey) return onFindFailedImagesClick();
 
     const job = assetJob = { stop: false, kind: 'retry' };
     const label = button.html();
@@ -1649,6 +1693,8 @@ async function onRetryFailedImagesClick() {
             } else {
                 try {
                     const { saved, failed } = await localizeImages(await fetchFullCharacter(avatar), { gap: 250 });
+                    // Cards listed by the Shift+click scan may never have been through Fetch assets
+                    await markAssetsChecked(avatar, ['images']);
                     result.saved += saved;
                     result.failed += failed;
                 } catch (error) {
@@ -1681,7 +1727,7 @@ async function onRetryFailedImagesClick() {
 async function onAssetsClick() {
     const button = $('#dupe_link_skip_expr_fetch');
     const status = $('#dupe_link_skip_expr_status');
-    if (assetJob?.kind === 'retry') {
+    if (assetJob?.kind) {
         toastr.warning('Stop Retry failed images first.', 'Dupe Link Skip');
         return;
     }
@@ -2429,7 +2475,7 @@ async function addSettingsPanel() {
             });
     }
     $('#dupe_link_skip_expr_fetch').on('click', () => onAssetsClick());
-    $('#dupe_link_skip_retry_images').on('click', () => onRetryFailedImagesClick());
+    $('#dupe_link_skip_retry_images').on('click', (event) => onRetryFailedImagesClick(event));
     $('#dupe_link_skip_view_failed').on('click', () => onViewFailedImagesClick());
     $('#dupe_link_skip_links_drawer .inline-drawer-toggle').on('click', () => renderAssetLinks());
     $('#dupe_link_skip_blacklist')
