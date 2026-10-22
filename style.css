@@ -105,3 +105,59 @@
 #dupe_link_skip_queue.collapsed .dls_queue_footer {
     display: none !important;
 }
+
+.dls_dupes h3 {
+    margin: 12px 0 4px;
+}
+
+.dls_dupes .dls_dupe_set {
+    margin: 6px 0;
+    padding: 6px 8px;
+    border: 1px solid var(--SmartThemeBorderColor);
+    border-radius: 8px;
+    text-align: left;
+}
+
+.dls_dupes .dls_dupe_row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 3px 0;
+}
+
+.dls_dupes .dls_dupe_row img {
+    width: 36px;
+    height: 48px;
+    object-fit: cover;
+    border-radius: 4px;
+    flex-shrink: 0;
+}
+
+.dls_dupes .dls_dupe_text {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.dls_dupes .dls_dupe_text small {
+    display: block;
+    opacity: 0.75;
+}
+
+.dls_dupes .dls_dupe_row.keep small {
+    color: #5c5;
+    opacity: 1;
+}
+
+.dls_dupes .dls_dupe_row.remove {
+    opacity: 0.8;
+}
+
+.dls_dupes .dls_dupe_row.remove small {
+    color: #e55;
+    opacity: 1;
+}
+
+.dls_dupes .dls_dupe_row.kept small {
+    color: #db3;
+    opacity: 1;
+}

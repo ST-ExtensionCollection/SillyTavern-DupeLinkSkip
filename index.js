@@ -1,10 +1,10 @@
-import { characters, eventSource, event_types, getRequestHeaders, processDroppedFiles, saveSettingsDebounced, this_chid } from '/script.js';
+import { characters, deleteCharacter, eventSource, event_types, getRequestHeaders, processDroppedFiles, saveSettingsDebounced, this_chid } from '/script.js';
 import { extension_settings, renderExtensionTemplateAsync } from '/scripts/extensions.js';
-import { Popup, POPUP_TYPE } from '/scripts/popup.js';
+import { Popup, POPUP_RESULT, POPUP_TYPE } from '/scripts/popup.js';
 import { renderTemplateAsync } from '/scripts/templates.js';
-import { debounce, getBase64Async, getStringHash, importFromExternalUrl, isValidUrl, uuidv4 } from '/scripts/utils.js';
-import { addTagsToEntity, removeTagFromEntity, tags, TAG_FOLDER_DEFAULT_TYPE } from '/scripts/tags.js';
-import { selected_group } from '/scripts/group-chats.js';
+import { debounce, getBase64Async, getSanitizedFilename, getStringHash, importFromExternalUrl, isValidUrl, timestampToMoment, uuidv4 } from '/scripts/utils.js';
+import { addTagsToEntity, removeTagFromEntity, tag_map, tags, TAG_FOLDER_DEFAULT_TYPE } from '/scripts/tags.js';
+import { groups, selected_group } from '/scripts/group-chats.js';
 import { importWorldInfo, world_info, world_names } from '/scripts/world-info.js';
 
 const MODULE = 'dupeLinkSkip';
@@ -326,13 +326,13 @@ async function getSprites(folder) {
     return response.json();
 }
 
-async function uploadSprite(folder, label, blob, url) {
-    const ext = new URL(url).pathname.match(/\.[a-z0-9]+$/i)?.[0] ?? '.png';
+async function uploadSprite(folder, label, blob, url, spriteName = label) {
+    const ext = new URL(url, location.href).pathname.match(/\.[a-z0-9]+$/i)?.[0] ?? '.png';
     const formData = new FormData();
     formData.append('name', folder);
     formData.append('label', label);
-    formData.append('avatar', new File([blob], `${label}${ext}`, { type: blob.type }));
-    formData.append('spriteName', label);
+    formData.append('avatar', new File([blob], `${spriteName}${ext}`, { type: blob.type }));
+    formData.append('spriteName', spriteName);
     const response = await fetch('/api/sprites/upload', {
         method: 'POST',
         headers: getRequestHeaders({ omitContentType: true }),
@@ -658,12 +658,16 @@ function imageFormat(blob, url) {
     return ext && Object.values(IMAGE_FORMATS).concat('jpeg').includes(ext) ? ext : '';
 }
 
-/** @returns {Promise<string[]>} File names in user/images/<folder> (creates the folder) */
-async function listGalleryImages(folder) {
+/**
+ * @param {string} folder
+ * @param {number} [type] Media types to list (bit flags as ST's MEDIA_REQUEST_TYPE); ST's default is images
+ * @returns {Promise<string[]>} File names in user/images/<folder> (creates the folder)
+ */
+async function listGalleryImages(folder, type = undefined) {
     const response = await fetch('/api/images/list', {
         method: 'POST',
         headers: getRequestHeaders(),
-        body: JSON.stringify({ folder }),
+        body: JSON.stringify({ folder, type }),
     });
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     return response.json();
@@ -985,7 +989,12 @@ async function localizeImages(character, { gap = 0, onProgress } = {}) {
 // V1 fields ST also keeps at the top level of the card (and reads from there in places)
 const TOP_LEVEL_FIELDS = { description: 'description', personality: 'personality', scenario: 'scenario', first_mes: 'first_mes', mes_example: 'mes_example', creator_notes: 'creatorcomment' };
 
-async function mergeCharacter(avatar, data) {
+/**
+ * @param {string} avatar
+ * @param {any} data Fields to merge into the card's data
+ * @param {any} [extra] Fields to merge into the card's top level as they are (e.g. fav)
+ */
+async function mergeCharacter(avatar, data, extra = {}) {
     const topLevel = {};
     for (const [field, top] of Object.entries(TOP_LEVEL_FIELDS)) {
         if (data[field] !== undefined) topLevel[top] = data[field];
@@ -993,7 +1002,7 @@ async function mergeCharacter(avatar, data) {
     const response = await fetch('/api/characters/merge-attributes', {
         method: 'POST',
         headers: getRequestHeaders(),
-        body: JSON.stringify({ avatar, ...topLevel, data }),
+        body: JSON.stringify({ avatar, ...topLevel, ...extra, data }),
     });
     if (!response.ok) throw new Error(`Saving character failed: ${response.status} ${response.statusText}`);
     const character = characters.find(c => c.avatar === avatar);
@@ -1526,6 +1535,590 @@ async function onRefreshClick(full) {
     }
 }
 
+const DUPLICATE_TAG = 'Possible duplicate';
+// Cards are copied here (as they were, with all their data) before being deleted
+const BACKUP_FOLDER = 'DupeLinkSkip-deleted';
+// Images, videos and audio (ST's MEDIA_REQUEST_TYPE flags)
+const ALL_MEDIA = 0b111;
+const IMAGE_EXTENSIONS = [...Object.values(IMAGE_FORMATS), 'jpeg'];
+let duplicateJob = false;
+
+/**
+ * Why a character must not be deleted, or null if it may be. Anything that
+ * can't be checked for sure counts as a reason, so errors never lead to a delete.
+ * @param {string} avatar
+ * @returns {Promise<string|null>}
+ */
+async function deletionBlocker(avatar) {
+    const listed = characters.find(c => c.avatar === avatar);
+    if (!listed) return 'not found';
+    if (Number(listed.chat_size) > 0 || Number(listed.date_last_chat) > 0) return 'has chats';
+    const group = groups.find(g => g.members?.includes(avatar));
+    if (group) return `in group "${group.name}"`;
+    try {
+        const response = await fetch('/api/characters/chats', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ avatar_url: avatar }),
+            cache: 'no-cache',
+        });
+        if (!response.ok) return 'could not check its chats';
+        const data = await response.json();
+        // ST answers {error: true} when the character has no chat folder; chat_size above covers read errors
+        const count = data?.error === true ? 0 : Object.keys(data ?? {}).length;
+        if (count) return `has ${count} chat${count === 1 ? '' : 's'}`;
+    } catch (error) {
+        console.warn('[Dupe Link Skip] Could not check chats for', avatar, error);
+        return 'could not check its chats';
+    }
+    return null;
+}
+
+/** @returns {number} When the character was created, for picking the original copy */
+function createdAt(character) {
+    const created = timestampToMoment(character.create_date)?.valueOf();
+    return Number.isFinite(created) ? created : (Number(character.date_added) || Infinity);
+}
+
+const galleryFolderOf = (character) => extension_settings.gallery?.folders?.[character.avatar] || character.name;
+const spriteFolderOf = (character) => getExpressionOverrides().find(o => o.name === avatarFolder(character.avatar))?.path || character.name;
+const galleryPath = (dir, file) => `/user/images/${encodeURIComponent(dir)}/${encodeURIComponent(file)}`;
+const fileExtension = (file) => file.match(/\.([a-z0-9]+)$/i)?.[1]?.toLowerCase() ?? '';
+const withoutExtension = (file) => file.replace(/\.[^.]+$/, '');
+
+/**
+ * @typedef {object} DuplicateCopy
+ * @property {string} avatar
+ * @property {string} name
+ * @property {number} created
+ * @property {string|null} blocker Why it can't be deleted
+ */
+
+/**
+ * @typedef {object} DuplicateSet Copies with identical content
+ * @property {DuplicateCopy} keeper
+ * @property {DuplicateCopy[]} remove Copies to merge into the keeper and delete
+ * @property {DuplicateCopy[]} kept Other copies that can't be deleted
+ */
+
+/**
+ * Finds characters sharing a source link or content. Copies with the same
+ * content become sets to merge; copies of the same link with other content
+ * are only reported.
+ * @param {(text: string) => void} onStatus
+ * @returns {Promise<{sets: DuplicateSet[], differing: DuplicateCopy[][]}>}
+ */
+async function findDuplicates(onStatus) {
+    // Every character needs a key and hash first
+    let { index } = await loadIndex();
+    if (characters.some(c => index[c.avatar]?.hash === undefined)) {
+        if (refreshPromise) await refreshPromise;
+        else await onRefreshClick(false);
+        ({ index } = await loadIndex());
+    }
+
+    onStatus('Looking for duplicates...');
+    const parent = new Map();
+    const find = (a) => {
+        while (parent.get(a) !== a) {
+            parent.set(a, parent.get(parent.get(a)));
+            a = parent.get(a);
+        }
+        return a;
+    };
+    const firstWith = new Map();
+    const join = (avatar, by) => {
+        if (!firstWith.has(by)) firstWith.set(by, avatar);
+        else parent.set(find(avatar), find(firstWith.get(by)));
+    };
+    for (const character of characters) {
+        const entry = index[character.avatar];
+        if (!entry) continue;
+        parent.set(character.avatar, character.avatar);
+        if (entry.key && !entry.key.startsWith('chublore:')) join(character.avatar, `key:${entry.key}`);
+        if (entry.hash) join(character.avatar, `hash:${entry.hash}`);
+    }
+
+    const clusters = new Map();
+    for (const character of characters) {
+        if (!parent.has(character.avatar)) continue;
+        const root = find(character.avatar);
+        if (!clusters.has(root)) clusters.set(root, []);
+        clusters.get(root).push(character);
+    }
+
+    const candidates = [...clusters.values()].filter(c => c.length > 1);
+    const toCopy = (c) => ({ avatar: c.avatar, name: c.name, created: createdAt(c), blocker: null });
+    const byAge = (a, b) => a.created - b.created || a.avatar.length - b.avatar.length || a.avatar.localeCompare(b.avatar);
+
+    /** @type {DuplicateCopy[][]} */
+    const identical = [];
+    /** @type {DuplicateCopy[][]} */
+    const differing = [];
+    for (const cluster of candidates) {
+        const byHash = new Map();
+        for (const character of cluster) {
+            const hash = index[character.avatar].hash || `none:${character.avatar}`;
+            if (!byHash.has(hash)) byHash.set(hash, []);
+            byHash.get(hash).push(toCopy(character));
+        }
+        for (const copies of byHash.values()) {
+            if (copies.length > 1) identical.push(copies.sort(byAge));
+        }
+        if (byHash.size > 1) differing.push(cluster.map(toCopy).sort(byAge));
+    }
+
+    // Check chats and groups for every copy that might be deleted
+    const queue = identical.flat();
+    const total = queue.length;
+    let done = 0;
+    const worker = async () => {
+        while (queue.length) {
+            const copy = queue.pop();
+            copy.blocker = await deletionBlocker(copy.avatar);
+            onStatus(`Checking chats... ${++done} / ${total}`);
+        }
+    };
+    await Promise.all(Array.from({ length: FETCH_CONCURRENCY }, worker));
+
+    const sets = identical.map(copies => {
+        // A copy that has to stay anyway (chats, group) is the one the rest merge into
+        const keeper = copies.find(c => c.blocker) ?? copies[0];
+        const others = copies.filter(c => c !== keeper);
+        return { keeper, remove: others.filter(c => !c.blocker), kept: others.filter(c => c.blocker) };
+    });
+    return { sets, differing };
+}
+
+/**
+ * Uploads a file to user/images/<folder> and checks it arrived unchanged.
+ * @returns {Promise<boolean>} Whether the stored copy has the same content
+ */
+async function uploadGalleryFile(folder, dir, name, format, blob) {
+    const image = (await getBase64Async(blob)).split(',')[1];
+    const response = await fetch('/api/images/upload', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ image, format, filename: name, ch_name: folder }),
+    });
+    if (!response.ok) throw new LocalSaveError(`Image upload failed: ${response.status} ${response.statusText}`);
+    try {
+        return await blobHash(await fetchBlob(galleryPath(dir, `${name}.${format}`))) === await blobHash(blob);
+    } catch {
+        return false;
+    }
+}
+
+/**
+ * Copies a duplicate's gallery images that the keeper's gallery lacks into it.
+ * @returns {Promise<{copied: number, cleanup: (() => Promise<void>)|null, renamed: Map<string, string>}>}
+ *   cleanup deletes the duplicate's images that are now in the keeper's folder, if no other character uses its folder
+ */
+async function mergeGallery(keeper, dupe, onStatus) {
+    const none = { copied: 0, cleanup: null, renamed: new Map() };
+    const from = galleryFolderOf(dupe);
+    const to = galleryFolderOf(keeper);
+    const fromDir = await getSanitizedFilename(from);
+    const toDir = await getSanitizedFilename(to);
+    if (fromDir === toDir || !(await listGalleryFolders()).includes(fromDir)) return none;
+
+    const files = await listGalleryImages(fromDir, ALL_MEDIA);
+    if (!files.length) return none;
+    const targetFiles = new Set(await listGalleryImages(toDir, ALL_MEDIA));
+    /** @type {Map<string, string>} hash -> file in the keeper's folder */
+    const targetHashes = new Map();
+    for (const file of targetFiles) {
+        if (!IMAGE_EXTENSIONS.includes(fileExtension(file))) continue;
+        try {
+            targetHashes.set(await blobHash(await fetchBlob(galleryPath(toDir, file))), file);
+        } catch (error) {
+            console.warn('[Dupe Link Skip] Could not read image', toDir, file, error);
+        }
+    }
+
+    // Duplicate's file -> the keeper's file with the same content
+    const renamed = new Map();
+    let copied = 0;
+    for (const [i, file] of files.entries()) {
+        onStatus(`gallery ${i + 1}/${files.length}`);
+        const ext = fileExtension(file);
+        // Videos and other files stay where they are
+        if (!IMAGE_EXTENSIONS.includes(ext)) continue;
+        const blob = await fetchBlob(galleryPath(fromDir, file));
+        const hash = await blobHash(blob);
+        if (targetHashes.has(hash)) {
+            renamed.set(file, targetHashes.get(hash));
+            continue;
+        }
+        let name = withoutExtension(file);
+        if (targetFiles.has(`${name}.${ext}`)) name = `${name}-${hash.slice(0, 6)}`;
+        if (targetFiles.has(`${name}.${ext}`)) continue;
+        if (await uploadGalleryFile(to, toDir, name, ext, blob)) {
+            targetFiles.add(`${name}.${ext}`);
+            targetHashes.set(hash, `${name}.${ext}`);
+            renamed.set(file, `${name}.${ext}`);
+            copied++;
+        }
+    }
+
+    const cleanup = async () => {
+        if (characters.some(c => galleryFolderOf(c) === from)) return;
+        for (const file of renamed.keys()) {
+            await fetch('/api/images/delete', {
+                method: 'POST',
+                headers: getRequestHeaders(),
+                body: JSON.stringify({ path: `user/images/${fromDir}/${file}` }),
+            });
+        }
+    };
+    return { copied, cleanup, renamed };
+}
+
+/** @returns {Promise<{label: string, spriteName: string, path: string, hash: string|null}[]>} */
+async function hashedSprites(folder) {
+    const sprites = [];
+    for (const sprite of await getSprites(folder)) {
+        const file = decodeURIComponent(sprite.path.split('?')[0].split('/').pop() ?? '');
+        let hash = null;
+        try {
+            hash = await blobHash(await fetchBlob(sprite.path));
+        } catch (error) {
+            console.warn('[Dupe Link Skip] Could not read sprite', sprite.path, error);
+        }
+        sprites.push({ label: sprite.label, spriteName: withoutExtension(file), path: sprite.path, hash });
+    }
+    return sprites;
+}
+
+/**
+ * Copies a duplicate's sprite folders (its own folder, named after its avatar
+ * file, and the packs downloaded into it) to the keeper. A folder whose
+ * sprites the keeper's matching folder lacks goes into its own subfolder,
+ * so packs don't get mixed.
+ * @returns {Promise<{copied: number, cleanup: (() => Promise<void>)|null}>}
+ *   cleanup deletes the duplicate's sprites that are now in the keeper's folders
+ */
+async function mergeSprites(keeper, dupe, onStatus) {
+    const kRoot = avatarFolder(keeper.avatar);
+    const dRoot = avatarFolder(dupe.avatar);
+    const packs = await loadPacks();
+    const override = getExpressionOverrides().find(o => o.name === dRoot)?.path;
+    const folders = [...new Set([dRoot, ...(packs[dupe.avatar]?.folders ?? []), ...(override ? [override] : [])])]
+        .filter(f => f === dRoot || f.startsWith(`${dRoot}/`));
+    const keeperUses = new Set([spriteFolderOf(keeper), ...(packs[keeper.avatar]?.folders ?? [])]);
+
+    /** @type {{folder: string, sprites: {label: string, spriteName: string}[]}[]} */
+    const removable = [];
+    const targets = [];
+    let copied = 0;
+    for (const folder of folders) {
+        if (keeperUses.has(folder)) continue;
+        const sprites = await hashedSprites(folder);
+        if (!sprites.length || sprites.some(s => !s.hash)) continue;
+
+        let target = folder === dRoot ? kRoot : `${kRoot}${folder.slice(dRoot.length)}`;
+        let existing = await hashedSprites(target);
+        const known = new Set(existing.map(s => s.hash));
+        if (existing.length && sprites.some(s => !known.has(s.hash))) {
+            target = `${kRoot}/${folder.replace(/[\\/]/g, '_')}`;
+            existing = await hashedSprites(target);
+        }
+
+        const taken = new Set(existing.map(s => s.spriteName.toLowerCase()));
+        const have = new Set(existing.map(s => s.hash));
+        for (const [i, sprite] of sprites.entries()) {
+            onStatus(`sprites ${i + 1}/${sprites.length}`);
+            if (have.has(sprite.hash) || taken.has(sprite.spriteName.toLowerCase())) continue;
+            await uploadSprite(target, sprite.label, await fetchBlob(sprite.path), sprite.path, sprite.spriteName);
+            taken.add(sprite.spriteName.toLowerCase());
+            copied++;
+        }
+
+        // Only sprites that really arrived count as moved
+        const stored = new Set((await hashedSprites(target)).map(s => s.hash));
+        const moved = sprites.filter(s => stored.has(s.hash));
+        if (moved.length) {
+            targets.push(target);
+            removable.push({ folder, sprites: moved });
+        }
+    }
+
+    if (targets.length) {
+        await recordPackFolders(keeper.avatar, targets);
+        await associateSprites(keeper, targets[0]);
+    }
+
+    const cleanup = async () => {
+        const allPacks = await loadPacks();
+        for (const { folder, sprites } of removable) {
+            const inUse = characters.some(c => spriteFolderOf(c) === folder || allPacks[c.avatar]?.folders?.includes(folder));
+            if (inUse) continue;
+            for (const { label, spriteName } of sprites) {
+                await fetch('/api/sprites/delete', {
+                    method: 'POST',
+                    headers: getRequestHeaders(),
+                    body: JSON.stringify({ name: folder, label, spriteName }),
+                });
+            }
+        }
+    };
+    return { copied, cleanup: removable.length ? cleanup : null };
+}
+
+/**
+ * Carries over what's linked to a duplicate's card: tags, favorite, lorebooks,
+ * the record of downloaded images, and the import record.
+ * @param {Map<string, string>} renamed Duplicate's gallery file -> keeper's file with that content
+ */
+async function mergeCardLinks(keeper, dupe, renamed, galleryDirs) {
+    const tagIds = tag_map[dupe.avatar] ?? [];
+    const dupeTags = tags.filter(t => tagIds.includes(t.id));
+    if (dupeTags.length) addTagsToEntity(dupeTags, keeper.avatar);
+
+    if ((dupe.fav || dupe.data?.extensions?.fav) && !(keeper.fav || keeper.data?.extensions?.fav)) {
+        await mergeCharacter(keeper.avatar, { extensions: { fav: true } }, { fav: true });
+        const listed = characters.find(c => c.avatar === keeper.avatar);
+        if (listed) listed.fav = true;
+    }
+
+    const dRoot = avatarFolder(dupe.avatar);
+    const books = [dupe.data?.extensions?.world, ...(world_info.charLore?.find(e => e.name === dRoot)?.extraBooks ?? [])]
+        .filter(name => name && world_names.includes(name));
+    if (books.length) await linkLorebooks(keeper, books);
+
+    // URLs already saved, so they aren't downloaded again; paths moved along with the files
+    const { fromDir, toDir } = galleryDirs;
+    const movePath = (path) => {
+        if (fromDir === toDir) return path;
+        const prefix = `/user/images/${encodeURIComponent(fromDir)}/`;
+        if (!path?.startsWith(prefix)) return path;
+        const file = renamed.get(decodeURIComponent(path.slice(prefix.length)));
+        return file ? galleryPath(toDir, file) : null;
+    };
+    const ours = keeper.data?.extensions?.dupe_link_skip ?? {};
+    const theirs = dupe.data?.extensions?.dupe_link_skip ?? {};
+    const additions = {};
+    for (const field of ['gallery', 'images']) {
+        for (const [url, path] of Object.entries(theirs[field] ?? {})) {
+            if (ours[field]?.[url]) continue;
+            const moved = movePath(path);
+            if (moved) (additions[field] ??= {})[url] = moved;
+        }
+    }
+    if (Object.keys(additions).length) await mergeCharacter(keeper.avatar, { extensions: { dupe_link_skip: additions } });
+
+    const settings = getSettings();
+    for (const [key, avatar] of Object.entries(settings.imported)) {
+        if (avatar === dupe.avatar) settings.imported[key] = keeper.avatar;
+    }
+    saveSettingsDebounced();
+}
+
+/** Copies a card's PNG, as it is, to the backup folder and checks the copy. */
+async function backupCard(avatar) {
+    const blob = await fetchBlob(`/characters/${encodeURIComponent(avatar)}`);
+    const name = `${avatarFolder(avatar)}-${Date.now()}`;
+    const dir = await getSanitizedFilename(BACKUP_FOLDER);
+    if (!(await uploadGalleryFile(BACKUP_FOLDER, dir, name, 'png', blob))) {
+        throw new Error(`Backup of ${avatar} could not be verified`);
+    }
+}
+
+/**
+ * Merges each set's other copies into its keeper, backs them up, and deletes
+ * them; then tags the copies of differing sets. A copy is only deleted when
+ * every step before succeeded and it still has no chats; its images and
+ * sprites are only removed once the card is gone.
+ * @param {DuplicateSet[]} sets
+ * @param {DuplicateCopy[][]} differing
+ * @param {(text: string) => void} onStatus
+ */
+async function cleanupDuplicates(sets, differing, onStatus) {
+    const toDelete = [];
+    /** @type {Map<string, (() => Promise<void>)[]>} avatar -> file removals to run after the card is deleted */
+    const cleanups = new Map();
+    const problems = [];
+    let images = 0, sprites = 0;
+
+    for (const [i, set] of sets.entries()) {
+        let keeper;
+        const reloadKeeper = async () => keeper = await fetchFullCharacter(set.keeper.avatar);
+        try {
+            await reloadKeeper();
+        } catch (error) {
+            console.error('[Dupe Link Skip] Could not read', set.keeper.avatar, error);
+            problems.push(`${set.keeper.name}: could not read the copy to keep`);
+            continue;
+        }
+        for (const copy of set.remove) {
+            const status = (step) => onStatus(`Merging ${i + 1} / ${sets.length}: ${copy.name} (${copy.avatar}) — ${step}`);
+            try {
+                const dupe = await fetchFullCharacter(copy.avatar);
+                const gallery = await mergeGallery(keeper, dupe, status);
+                const sprite = await mergeSprites(keeper, dupe, status);
+                status('card');
+                const galleryDirs = {
+                    fromDir: await getSanitizedFilename(galleryFolderOf(dupe)),
+                    toDir: await getSanitizedFilename(galleryFolderOf(keeper)),
+                };
+                await mergeCardLinks(keeper, dupe, gallery.renamed, galleryDirs);
+                // Later copies merge into what this one added
+                await reloadKeeper();
+                status('backup');
+                await backupCard(dupe.avatar);
+                // Hard stop: checked again right before deleting
+                const blocker = await deletionBlocker(dupe.avatar);
+                if (blocker) {
+                    problems.push(`${copy.name} (${copy.avatar}): not deleted, ${blocker}`);
+                    continue;
+                }
+                images += gallery.copied;
+                sprites += sprite.copied;
+                toDelete.push(dupe.avatar);
+                cleanups.set(dupe.avatar, [gallery.cleanup, sprite.cleanup].filter(Boolean));
+            } catch (error) {
+                console.error('[Dupe Link Skip] Could not merge', copy.avatar, 'into', set.keeper.avatar, error);
+                problems.push(`${copy.name} (${copy.avatar}): ${error?.message ?? error}`);
+            }
+        }
+    }
+
+    let deleted = 0;
+    if (toDelete.length) {
+        onStatus(`Deleting ${toDelete.length} duplicate${toDelete.length === 1 ? '' : 's'}...`);
+        // Chats are never deleted, even if one appeared since the check
+        await deleteCharacter(toDelete, { deleteChats: false });
+        for (const avatar of toDelete) {
+            if (characters.some(c => c.avatar === avatar)) {
+                problems.push(`${avatar}: ST did not delete it`);
+                continue;
+            }
+            deleted++;
+            const dRoot = avatarFolder(avatar);
+            if (extension_settings.gallery?.folders?.[avatar]) delete extension_settings.gallery.folders[avatar];
+            const lore = world_info.charLore?.findIndex(e => e.name === dRoot) ?? -1;
+            if (lore !== -1) world_info.charLore.splice(lore, 1);
+            const override = getExpressionOverrides().findIndex(o => o.name === dRoot);
+            if (override !== -1) getExpressionOverrides().splice(override, 1);
+            for (const cleanup of cleanups.get(avatar) ?? []) {
+                try {
+                    await cleanup();
+                } catch (error) {
+                    console.warn('[Dupe Link Skip] Could not remove merged files of', avatar, error);
+                }
+            }
+        }
+        saveSettingsDebounced();
+    }
+
+    const deletedSet = new Set(toDelete);
+    for (const copies of differing) {
+        for (const copy of copies) {
+            if (!deletedSet.has(copy.avatar)) tagCharacter(copy.avatar, DUPLICATE_TAG);
+        }
+    }
+
+    return { deleted, images, sprites, problems };
+}
+
+/** Builds the popup listing what was found; returns it with its set checkboxes. */
+function renderDuplicates({ sets, differing }) {
+    const root = $('<div class="dls_dupes"></div>');
+    const date = (copy) => Number.isFinite(copy.created) ? new Date(copy.created).toLocaleDateString() : '?';
+    const row = (copy, state, note) => {
+        const item = $('<div class="dls_dupe_row"></div>').addClass(state);
+        item.append($('<img loading="lazy" alt="">').attr('src', `/thumbnail?type=avatar&file=${encodeURIComponent(copy.avatar)}`));
+        const text = $('<div class="dls_dupe_text"></div>');
+        text.append($('<div></div>').text(copy.name));
+        text.append($('<small></small>').text(`${copy.avatar} · created ${date(copy)} · ${note}`));
+        return item.append(text);
+    };
+
+    const actionable = sets.filter(s => s.remove.length);
+    const blocked = sets.reduce((n, s) => n + s.kept.length, 0);
+    root.append($('<p></p>').text(
+        `Identical copies are merged into the one kept: gallery images, sprites, tags, favorite and lorebooks. ` +
+        `Images already there are not copied twice; nothing unique is removed. ` +
+        `Each deleted card is first backed up to user/images/${BACKUP_FOLDER}. ` +
+        `Characters with chats or in a group are never deleted.`,
+    ));
+
+    const boxes = [];
+    if (sets.length) {
+        root.append($('<h3></h3>').text(`Identical copies (${sets.length} set${sets.length === 1 ? '' : 's'}, ${blocked} kept because of chats or groups)`));
+        for (const set of sets) {
+            const block = $('<div class="dls_dupe_set"></div>');
+            const box = $('<input type="checkbox">').prop('checked', set.remove.length > 0).prop('disabled', !set.remove.length);
+            boxes.push(box);
+            block.append($('<label class="checkbox_label"></label>').append(box, $('<b></b>').text(set.keeper.name)));
+            block.append(row(set.keeper, 'keep', set.keeper.blocker ? `keep (${set.keeper.blocker})` : 'keep (oldest)'));
+            for (const copy of set.remove) block.append(row(copy, 'remove', 'merge & delete'));
+            for (const copy of set.kept) block.append(row(copy, 'kept', `kept: ${copy.blocker}`));
+            root.append(block);
+        }
+    }
+    if (differing.length) {
+        root.append($('<h3></h3>').text(`Same link, different content (${differing.length})`));
+        root.append($('<small></small>').text(`Not merged or deleted. Copies left are tagged "${DUPLICATE_TAG}" so you can compare them yourself.`));
+        for (const copies of differing) {
+            const block = $('<div class="dls_dupe_set"></div>');
+            for (const copy of copies) block.append(row(copy, 'differing', 'tag only'));
+            root.append(block);
+        }
+    }
+    return { root, boxes, actionable };
+}
+
+async function onFlagDuplicatesClick() {
+    if (duplicateJob) return;
+    if (importQueue.running || assetJob) {
+        toastr.warning('Wait for the running import or Fetch assets job to finish first.', 'Dupe Link Skip');
+        return;
+    }
+    duplicateJob = true;
+    const button = $('#dupe_link_skip_flag_dupes').addClass('disabled').prop('disabled', true);
+    const status = $('#dupe_link_skip_status');
+    const onStatus = (text) => status.text(text);
+    try {
+        const found = await findDuplicates(onStatus);
+        await updateStatus();
+        if (!found.sets.length && !found.differing.length) {
+            toastr.success('No duplicates found.', 'Dupe Link Skip');
+            return;
+        }
+
+        const { root, boxes } = renderDuplicates(found);
+        const chosen = () => found.sets.filter((_, i) => boxes[i].prop('checked'));
+        const okText = () => {
+            const count = chosen().reduce((n, s) => n + s.remove.length, 0);
+            return count ? `Merge & delete ${count}` : (found.differing.length ? 'Tag only' : 'OK');
+        };
+        const popup = new Popup(root, POPUP_TYPE.CONFIRM, '', { wide: true, large: true, allowVerticalScrolling: true, okButton: okText(), cancelButton: 'Cancel' });
+        for (const box of boxes) box.on('change', () => $(popup.okButton).text(okText()));
+        if (await popup.show() !== POPUP_RESULT.AFFIRMATIVE) return;
+
+        const sets = chosen().filter(s => s.remove.length);
+        const result = await cleanupDuplicates(sets, found.differing, onStatus);
+        const summary = `Deleted ${result.deleted} duplicate${result.deleted === 1 ? '' : 's'}, moved ${result.images} gallery image${result.images === 1 ? '' : 's'} and ${result.sprites} sprite${result.sprites === 1 ? '' : 's'}.`;
+        if (result.problems.length) {
+            console.warn('[Dupe Link Skip] Duplicate cleanup problems:', result.problems);
+            const list = $('<ul></ul>');
+            for (const problem of result.problems) list.append($('<li></li>').text(problem));
+            await new Popup($('<div></div>').append($('<p></p>').text(summary), $('<p></p>').text('Left alone:'), list), POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true }).show();
+        } else {
+            toastr.success(summary, 'Dupe Link Skip');
+        }
+    } catch (error) {
+        console.error('[Dupe Link Skip] Flag duplicates failed', error);
+        toastr.error(String(error), 'Flag duplicates failed');
+    } finally {
+        duplicateJob = false;
+        button.removeClass('disabled').prop('disabled', false);
+        await updateStatus();
+        publishOwnedDebounced();
+    }
+}
+
 async function addSettingsPanel() {
     const html = await renderExtensionTemplateAsync(EXTENSION_PATH, 'settings');
     $('#extensions_settings2').append(html);
@@ -1592,6 +2185,7 @@ async function addSettingsPanel() {
         });
     $('#dupe_link_skip_load_new').on('click', () => onRefreshClick(false));
     $('#dupe_link_skip_rebuild').on('click', () => onRefreshClick(true));
+    $('#dupe_link_skip_flag_dupes').on('click', () => onFlagDuplicatesClick());
     // Keep status current when the drawer is opened
     $('#dupe_link_skip_settings .inline-drawer-toggle').on('click', () => updateStatus());
     await updateStatus();
@@ -2033,5 +2627,11 @@ eventSource.on(event_types.CHARACTER_DELETED, async ({ character }) => {
     if (packs[avatar]) {
         delete packs[avatar];
         await sourceCache.setItem('packs', packs);
+    }
+    for (const key of ['index', 'expressionsChecked', 'assetsChecked', 'assetLinks']) {
+        const map = (await sourceCache.getItem(key)) ?? {};
+        if (map[avatar] === undefined) continue;
+        delete map[avatar];
+        await sourceCache.setItem(key, map);
     }
 });
